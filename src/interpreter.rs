@@ -2,18 +2,18 @@
 //!
 //! Phase 4 在這裡加入型別檢查、import 與擴充標準庫。
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Stdin, Stdout, Write};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use crate::ast::{BinaryOperator, Expr, Pattern, Program, Statement, TypeAnnotation, UnaryOperator};
 use crate::environment::{
-    BuiltinFunction, EnvRef, Environment, FunctionValue, StructDef, StructInstanceValue, Value,
+    array_value, enum_variant_value, map_value, render_value, string_value, struct_instance_value,
+    BuiltinFunction, EnumDef, EnvRef, Environment, FunctionValue, StructDef, Value,
 };
 use crate::error::{Result, TinyLangError};
+use crate::gc::{GcHeap, GcStructRef};
 
 /// 迴圈與函式共用的控制流程訊號。
 #[derive(Debug, Clone)]
@@ -43,6 +43,7 @@ pub struct Interpreter<W: Write, R: BufRead> {
     input: R,
     current_dir: PathBuf,
     imported_files: HashSet<PathBuf>,
+    heap: GcHeap,
 }
 
 impl Interpreter<Stdout, BufReader<Stdin>> {
@@ -67,6 +68,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             input,
             current_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             imported_files: HashSet::new(),
+            heap: GcHeap::new(),
         }
     }
 
@@ -129,6 +131,21 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                         fields: fields.clone(),
                     },
                 );
+                Ok(Value::Null)
+            }
+            Statement::EnumDecl { name, variants } => {
+                use crate::environment::EnumVariantDef;
+                let enum_def = EnumDef {
+                    name: name.clone(),
+                    variants: variants
+                        .iter()
+                        .map(|v| EnumVariantDef {
+                            name: v.name.clone(),
+                            fields: v.fields.clone(),
+                        })
+                        .collect(),
+                };
+                self.env.borrow_mut().define_enum(name.clone(), enum_def);
                 Ok(Value::Null)
             }
             Statement::LetDecl {
@@ -255,9 +272,11 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 Ok(_) => Ok(Value::Null),
                 Err(Signal::Error(err)) => {
                     let catch_env = Environment::enclosed(self.env.clone());
+                    let err_str = err.to_string();
+                    let err_val = string_value(&mut self.heap, err_str);
                     catch_env
                         .borrow_mut()
-                        .define(catch_var.clone(), Value::String(err.to_string()));
+                        .define(catch_var.clone(), err_val);
                     self.execute_block(catch_body, catch_env)
                 }
                 Err(other) => Err(other),
@@ -265,7 +284,8 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             Statement::Match { expr, arms } => self.execute_match_statement(expr, arms),
             Statement::Print(expr) => {
                 let value = self.evaluate_expr(expr)?;
-                writeln!(self.output, "{value}")
+                let rendered = render_value(&self.heap, &value);
+                writeln!(self.output, "{rendered}")
                     .map_err(|err| Signal::Error(TinyLangError::io(err.to_string())))?;
                 Ok(Value::Null)
             }
@@ -309,16 +329,19 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
     fn evaluate_expr(&mut self, expr: &Expr) -> RuntimeResult<Value> {
         match expr {
             Expr::IntLit(value) => Ok(Value::Int(*value)),
-            Expr::StringLit(value) => Ok(Value::String(value.clone())),
+            Expr::StringLit(value) => Ok(string_value(&mut self.heap, value.clone())),
             Expr::BoolLit(value) => Ok(Value::Bool(*value)),
             Expr::Ident(name) => Ok(self.env.borrow().get(name)?),
             Expr::StructInit { name, fields } => self.create_struct_instance(name, fields),
+            Expr::EnumVariant { enum_name, variant, fields } => {
+                self.create_enum_variant(enum_name, variant, fields.as_deref())
+            }
             Expr::ArrayLit(items) => {
                 let mut values = Vec::new();
                 for item in items {
                     values.push(self.evaluate_expr(item)?);
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(values))))
+                Ok(array_value(&mut self.heap, values))
             }
             Expr::MapLit(items) => {
                 let mut values = HashMap::new();
@@ -328,7 +351,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                     let value = self.evaluate_expr(value_expr)?;
                     values.insert(key, value);
                 }
-                Ok(Value::Map(Rc::new(RefCell::new(values))))
+                Ok(map_value(&mut self.heap, values))
             }
             Expr::IndexAccess { target, index } => {
                 let target_value = self.evaluate_expr(target)?;
@@ -447,7 +470,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
     fn call_method_with_values(
         &mut self,
         function: &FunctionValue,
-        receiver: StructInstanceValue,
+        receiver: GcStructRef,
         values: Vec<Value>,
     ) -> RuntimeResult<Value> {
         if function.params.len() != values.len() {
@@ -491,9 +514,18 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             BuiltinFunction::Len => {
                 let values = self.eval_args("len", 1, args)?;
                 match &values[0] {
-                    Value::Array(items) => Ok(Value::Int(items.borrow().len() as i64)),
-                    Value::String(value) => Ok(Value::Int(value.chars().count() as i64)),
-                    Value::Map(items) => Ok(Value::Int(items.borrow().len() as i64)),
+                    Value::Array(items) => {
+                        let items = items.clone();
+                        Ok(Value::Int(self.heap.with_array(&items, |arr| arr.len()) as i64))
+                    }
+                    Value::String(text) => {
+                        let text = text.clone();
+                        Ok(Value::Int(self.heap.get_string(&text).chars().count() as i64))
+                    }
+                    Value::Map(items) => {
+                        let items = items.clone();
+                        Ok(Value::Int(self.heap.with_map(&items, |m| m.len()) as i64))
+                    }
                     other => Err(Signal::Error(TinyLangError::runtime(format!(
                         "Function 'len' expects Array, String, or Map, got {}",
                         other.type_name_for_error()
@@ -504,7 +536,9 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 let values = self.eval_args("push", 2, args)?;
                 match &values[0] {
                     Value::Array(items) => {
-                        items.borrow_mut().push(values[1].clone());
+                        let arr_ref = items.clone();
+                        let item = values[1].clone();
+                        self.heap.with_array_mut(&arr_ref, |arr| arr.push(item));
                         Ok(Value::Null)
                     }
                     other => Err(Signal::Error(TinyLangError::runtime(format!(
@@ -516,7 +550,10 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             BuiltinFunction::Pop => {
                 let values = self.eval_args("pop", 1, args)?;
                 match &values[0] {
-                    Value::Array(items) => Ok(items.borrow_mut().pop().unwrap_or(Value::Null)),
+                    Value::Array(items) => {
+                        let arr_ref = items.clone();
+                        Ok(self.heap.with_array_mut(&arr_ref, |arr| arr.pop().unwrap_or(Value::Null)))
+                    }
                     other => Err(Signal::Error(TinyLangError::runtime(format!(
                         "Function 'pop' expects Array, got {}",
                         other.type_name_for_error()
@@ -525,7 +562,8 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             }
             BuiltinFunction::Str => {
                 let values = self.eval_args("str", 1, args)?;
-                Ok(Value::String(values[0].to_string()))
+                let rendered = render_value(&self.heap, &values[0]);
+                Ok(string_value(&mut self.heap, rendered))
             }
             BuiltinFunction::Int => {
                 let values = self.eval_args("int", 1, args)?;
@@ -533,12 +571,16 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             }
             BuiltinFunction::TypeOf => {
                 let values = self.eval_args("typeof", 1, args)?;
-                Ok(Value::String(values[0].type_name_for_builtin()))
+                let type_name = values[0].type_name_for_builtin();
+                Ok(string_value(&mut self.heap, type_name))
             }
             BuiltinFunction::Input => {
                 let values = self.eval_args("input", 1, args)?;
                 let prompt = match &values[0] {
-                    Value::String(prompt) => prompt.clone(),
+                    Value::String(text) => {
+                        let text = text.clone();
+                        self.heap.get_string(&text)
+                    }
                     other => {
                         return Err(Signal::Error(TinyLangError::runtime(format!(
                             "Function 'input' expects String prompt, got {}",
@@ -560,24 +602,27 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                     line.pop();
                 }
 
-                Ok(Value::String(line))
+                Ok(string_value(&mut self.heap, line))
             }
             BuiltinFunction::Range => {
                 let values = self.eval_args("range", 2, args)?;
                 let start = self.expect_int(values[0].clone(), "range start")?;
                 let end = self.expect_int(values[1].clone(), "range end")?;
                 let items = (start..end).map(Value::Int).collect::<Vec<_>>();
-                Ok(Value::Array(Rc::new(RefCell::new(items))))
+                Ok(array_value(&mut self.heap, items))
             }
             BuiltinFunction::Keys => {
                 let values = self.eval_args("keys", 1, args)?;
                 match &values[0] {
                     Value::Map(items) => {
-                        let mut keys = items.borrow().keys().cloned().collect::<Vec<_>>();
+                        let items = items.clone();
+                        let mut keys = self.heap.with_map(&items, |m| m.keys().cloned().collect::<Vec<_>>());
                         keys.sort();
-                        Ok(Value::Array(Rc::new(RefCell::new(
-                            keys.into_iter().map(Value::String).collect(),
-                        ))))
+                        let mut key_values = Vec::new();
+                        for k in keys {
+                            key_values.push(string_value(&mut self.heap, k));
+                        }
+                        Ok(array_value(&mut self.heap, key_values))
                     }
                     other => Err(Signal::Error(TinyLangError::runtime(format!(
                         "Function 'keys' expects Map, got {}",
@@ -589,15 +634,15 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 let values = self.eval_args("values", 1, args)?;
                 match &values[0] {
                     Value::Map(items) => {
-                        let mut entries = items
-                            .borrow()
-                            .iter()
-                            .map(|(key, value)| (key.clone(), value.clone()))
-                            .collect::<Vec<_>>();
+                        let items = items.clone();
+                        let mut entries = self.heap.with_map(&items, |m| {
+                            m.iter()
+                                .map(|(key, value)| (key.clone(), value.clone()))
+                                .collect::<Vec<_>>()
+                        });
                         entries.sort_by(|a, b| a.0.cmp(&b.0));
-                        Ok(Value::Array(Rc::new(RefCell::new(
-                            entries.into_iter().map(|(_, value)| value).collect(),
-                        ))))
+                        let result = entries.into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+                        Ok(array_value(&mut self.heap, result))
                     }
                     other => Err(Signal::Error(TinyLangError::runtime(format!(
                         "Function 'values' expects Map, got {}",
@@ -636,34 +681,42 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 let values = self.eval_args("split", 2, args)?;
                 let text = self.expect_string(values[0].clone(), "split first argument")?;
                 let sep = self.expect_string(values[1].clone(), "split second argument")?;
-                let parts = if sep.is_empty() {
-                    text.chars().map(|ch| Value::String(ch.to_string())).collect()
+                let parts_strs: Vec<String> = if sep.is_empty() {
+                    text.chars().map(|ch| ch.to_string()).collect()
                 } else {
-                    text.split(&sep).map(|part| Value::String(part.to_string())).collect()
+                    text.split(&sep).map(|part| part.to_string()).collect()
                 };
-                Ok(Value::Array(Rc::new(RefCell::new(parts))))
+                let mut parts = Vec::new();
+                for s in parts_strs {
+                    parts.push(string_value(&mut self.heap, s));
+                }
+                Ok(array_value(&mut self.heap, parts))
             }
             BuiltinFunction::Join => {
                 let values = self.eval_args("join", 2, args)?;
                 let items = self.expect_array(values[0].clone(), "join first argument")?;
                 let sep = self.expect_string(values[1].clone(), "join second argument")?;
-                let rendered = items.into_iter().map(|item| item.to_string()).collect::<Vec<_>>();
-                Ok(Value::String(rendered.join(&sep)))
+                let mut rendered_parts = Vec::new();
+                for item in &items {
+                    rendered_parts.push(render_value(&self.heap, item));
+                }
+                let result = rendered_parts.join(&sep);
+                Ok(string_value(&mut self.heap, result))
             }
             BuiltinFunction::Trim => {
                 let values = self.eval_args("trim", 1, args)?;
                 let text = self.expect_string(values[0].clone(), "trim argument")?;
-                Ok(Value::String(text.trim().to_string()))
+                Ok(string_value(&mut self.heap, text.trim().to_string()))
             }
             BuiltinFunction::Upper => {
                 let values = self.eval_args("upper", 1, args)?;
                 let text = self.expect_string(values[0].clone(), "upper argument")?;
-                Ok(Value::String(text.to_uppercase()))
+                Ok(string_value(&mut self.heap, text.to_uppercase()))
             }
             BuiltinFunction::Lower => {
                 let values = self.eval_args("lower", 1, args)?;
                 let text = self.expect_string(values[0].clone(), "lower argument")?;
-                Ok(Value::String(text.to_lowercase()))
+                Ok(string_value(&mut self.heap, text.to_lowercase()))
             }
             BuiltinFunction::Contains => {
                 let values = self.eval_args("contains", 2, args)?;
@@ -676,22 +729,52 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 let text = self.expect_string(values[0].clone(), "replace first argument")?;
                 let old = self.expect_string(values[1].clone(), "replace second argument")?;
                 let new = self.expect_string(values[2].clone(), "replace third argument")?;
-                Ok(Value::String(text.replace(&old, &new)))
+                Ok(string_value(&mut self.heap, text.replace(&old, &new)))
             }
             BuiltinFunction::Sort => {
                 let values = self.eval_args("sort", 1, args)?;
                 match &values[0] {
                     Value::Array(items) => {
-                        let mut items_ref = items.borrow_mut();
-                        if items_ref.iter().all(|item| matches!(item, Value::Int(_))) {
-                            items_ref.sort_by_key(|item| match item {
-                                Value::Int(value) => *value,
-                                _ => 0,
+                        let arr_ref = items.clone();
+                        // Check what kind of items we have
+                        let all_int = self.heap.with_array(&arr_ref, |arr| {
+                            arr.iter().all(|item| matches!(item, Value::Int(_)))
+                        });
+                        let all_str = self.heap.with_array(&arr_ref, |arr| {
+                            arr.iter().all(|item| matches!(item, Value::String(_)))
+                        });
+
+                        if all_int {
+                            self.heap.with_array_mut(&arr_ref, |arr| {
+                                arr.sort_by_key(|item| match item {
+                                    Value::Int(value) => *value,
+                                    _ => 0,
+                                });
                             });
-                        } else if items_ref.iter().all(|item| matches!(item, Value::String(_))) {
-                            items_ref.sort_by_key(|item| match item {
-                                Value::String(value) => value.clone(),
-                                _ => String::new(),
+                        } else if all_str {
+                            // Extract string keys without borrowing heap mutably through closures
+                            let str_refs: Vec<crate::gc::GcStringRef> =
+                                self.heap.with_array(&arr_ref, |arr| {
+                                    arr.iter()
+                                        .map(|item| match item {
+                                            Value::String(r) => r.clone(),
+                                            _ => unreachable!(),
+                                        })
+                                        .collect()
+                                });
+                            let mut string_keys: Vec<(usize, String)> = str_refs
+                                .iter()
+                                .enumerate()
+                                .map(|(i, r)| (i, self.heap.get_string(r)))
+                                .collect();
+                            string_keys.sort_by(|a, b| a.1.cmp(&b.1));
+                            let sorted_indices: Vec<usize> =
+                                string_keys.into_iter().map(|(i, _)| i).collect();
+                            self.heap.with_array_mut(&arr_ref, |arr| {
+                                let original = arr.clone();
+                                for (new_pos, old_pos) in sorted_indices.iter().enumerate() {
+                                    arr[new_pos] = original[*old_pos].clone();
+                                }
                             });
                         } else {
                             return Err(Signal::Error(TinyLangError::runtime(
@@ -710,7 +793,8 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 let values = self.eval_args("reverse", 1, args)?;
                 match &values[0] {
                     Value::Array(items) => {
-                        items.borrow_mut().reverse();
+                        let arr_ref = items.clone();
+                        self.heap.with_array_mut(&arr_ref, |arr| arr.reverse());
                         Ok(values[0].clone())
                     }
                     other => Err(Signal::Error(TinyLangError::runtime(format!(
@@ -727,7 +811,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 for item in items {
                     result.push(self.call_function_with_values(&callback, vec![item])?);
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(result))))
+                Ok(array_value(&mut self.heap, result))
             }
             BuiltinFunction::Filter => {
                 let values = self.eval_args("filter", 2, args)?;
@@ -740,7 +824,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                         result.push(item);
                     }
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(result))))
+                Ok(array_value(&mut self.heap, result))
             }
             BuiltinFunction::Reduce => {
                 let values = self.eval_args("reduce", 3, args)?;
@@ -791,9 +875,9 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         Ok(values)
     }
 
-    fn iterate_values(&self, value: Value) -> RuntimeResult<Vec<Value>> {
+    fn iterate_values(&mut self, value: Value) -> RuntimeResult<Vec<Value>> {
         match value {
-            Value::Array(items) => Ok(items.borrow().clone()),
+            Value::Array(items) => Ok(self.heap.with_array(&items, |arr| arr.clone())),
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "for loop expects Array iterable, got {}",
                 other.type_name_for_error()
@@ -805,13 +889,15 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         match value {
             Value::Int(value) => Ok(Value::Int(*value)),
             Value::Bool(value) => Ok(Value::Int(if *value { 1 } else { 0 })),
-            Value::String(value) => value
-                .parse::<i64>()
-                .map(Value::Int)
-                .map_err(|_| Signal::Error(TinyLangError::runtime(format!(
-                    "Cannot convert String '{}' to Int",
-                    value
-                )))),
+            Value::String(text) => {
+                let s = self.heap.get_string(text);
+                s.parse::<i64>()
+                    .map(Value::Int)
+                    .map_err(|_| Signal::Error(TinyLangError::runtime(format!(
+                        "Cannot convert String '{}' to Int",
+                        s
+                    ))))
+            }
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "Cannot convert {} to Int",
                 other.type_name_for_error()
@@ -845,7 +931,14 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 _ => None,
             },
             Pattern::StringLit(expected) => match value {
-                Value::String(actual) if actual == expected => Some(None),
+                Value::String(actual) => {
+                    let actual_str = self.heap.get_string(actual);
+                    if &actual_str == expected {
+                        Some(None)
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             },
             Pattern::BoolLit(expected) => match value {
@@ -854,6 +947,27 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             },
             Pattern::Ident(name) => Some(Some((name.clone(), value.clone()))),
             Pattern::Wildcard => Some(None),
+            Pattern::EnumVariant { enum_name, variant, bindings } => match value {
+                Value::EnumVariant(reference) => {
+                    let ev = self.heap.get_enum_variant(reference);
+                    if ev.enum_name != *enum_name || ev.variant_name != *variant {
+                        return None;
+                    }
+                    if let Some(binding_names) = bindings {
+                        // Return first binding (simplified: bind whole variant for now)
+                        if binding_names.is_empty() {
+                            Some(None)
+                        } else {
+                            // Bind field values by position
+                            // For simplicity, just bind whole value to first name
+                            Some(Some((binding_names[0].clone(), value.clone())))
+                        }
+                    } else {
+                        Some(None)
+                    }
+                }
+                _ => None,
+            },
         }
     }
 
@@ -889,16 +1003,30 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             }
         }
 
-        Ok(Value::StructInstance(StructInstanceValue {
-            type_name: name.to_string(),
-            fields: Rc::new(RefCell::new(values)),
-        }))
+        Ok(struct_instance_value(&mut self.heap, name.to_string(), values))
+    }
+
+    fn create_enum_variant(
+        &mut self,
+        enum_name: &str,
+        variant_name: &str,
+        fields: Option<&[(String, Expr)]>,
+    ) -> RuntimeResult<Value> {
+        let mut values = std::collections::HashMap::new();
+        if let Some(fields) = fields {
+            for (field_name, expr) in fields {
+                let value = self.evaluate_expr(expr)?;
+                values.insert(field_name.clone(), value);
+            }
+        }
+        Ok(enum_variant_value(&mut self.heap, enum_name.to_string(), variant_name.to_string(), values))
     }
 
     fn assign_field(&mut self, object: Value, field: &str, value: Value) -> RuntimeResult<Value> {
         match object {
             Value::StructInstance(instance) => {
-                let struct_def = self.env.borrow().get_struct(&instance.type_name)?;
+                let type_name = self.heap.with_struct_instance(&instance, |inst| inst.type_name.clone());
+                let struct_def = self.env.borrow().get_struct(&type_name)?;
                 let field_def = struct_def
                     .fields
                     .iter()
@@ -906,15 +1034,18 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                     .ok_or_else(|| {
                         Signal::Error(TinyLangError::runtime(format!(
                             "Struct '{}' has no field '{}'",
-                            instance.type_name, field
+                            type_name, field
                         )))
-                    })?;
+                    })?
+                    .clone();
 
                 if let Some(annotation) = &field_def.1 {
                     self.ensure_type_matches(annotation, &value)?;
                 }
 
-                instance.fields.borrow_mut().insert(field.to_string(), value);
+                self.heap.with_struct_instance_mut(&instance, |inst| {
+                    inst.fields.insert(field.to_string(), value);
+                });
                 Ok(Value::Null)
             }
             other => Err(Signal::Error(TinyLangError::runtime(format!(
@@ -928,20 +1059,24 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         match target {
             Value::Array(items) => {
                 let idx = self.expect_index(index)?;
-                let mut items = items.borrow_mut();
-                if idx >= items.len() {
-                    return Err(Signal::Error(TinyLangError::runtime(format!(
-                        "Index out of bounds: array length is {}, index is {}",
-                        items.len(),
-                        idx
-                    ))));
-                }
-                items[idx] = value;
-                Ok(Value::Null)
+                self.heap.with_array_mut(&items, |arr| {
+                    if idx >= arr.len() {
+                        Err(Signal::Error(TinyLangError::runtime(format!(
+                            "Index out of bounds: array length is {}, index is {}",
+                            arr.len(),
+                            idx
+                        ))))
+                    } else {
+                        arr[idx] = value;
+                        Ok(Value::Null)
+                    }
+                })
             }
             Value::Map(items) => {
                 let key = self.expect_map_key(index)?;
-                items.borrow_mut().insert(key, value);
+                self.heap.with_map_mut(&items, |m| {
+                    m.insert(key, value);
+                });
                 Ok(Value::Null)
             }
             other => Err(Signal::Error(TinyLangError::runtime(format!(
@@ -951,33 +1086,39 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         }
     }
 
-    fn read_index(&self, target: Value, index: Value) -> RuntimeResult<Value> {
+    fn read_index(&mut self, target: Value, index: Value) -> RuntimeResult<Value> {
         match target {
             Value::Array(items) => {
                 let idx = self.expect_index(index)?;
-                let items = items.borrow();
-                items.get(idx).cloned().ok_or_else(|| {
-                    Signal::Error(TinyLangError::runtime(format!(
-                        "Index out of bounds: array length is {}, index is {}",
-                        items.len(),
-                        idx
-                    )))
+                self.heap.with_array(&items, |arr| {
+                    arr.get(idx).cloned().ok_or_else(|| {
+                        Signal::Error(TinyLangError::runtime(format!(
+                            "Index out of bounds: array length is {}, index is {}",
+                            arr.len(),
+                            idx
+                        )))
+                    })
                 })
             }
             Value::String(text) => {
                 let idx = self.expect_index(index)?;
-                let chars: Vec<char> = text.chars().collect();
-                chars.get(idx).map(|ch| Value::String(ch.to_string())).ok_or_else(|| {
-                    Signal::Error(TinyLangError::runtime(format!(
+                let s = self.heap.get_string(&text);
+                let chars: Vec<char> = s.chars().collect();
+                match chars.get(idx) {
+                    Some(ch) => {
+                        let ch_str = ch.to_string();
+                        Ok(string_value(&mut self.heap, ch_str))
+                    }
+                    None => Err(Signal::Error(TinyLangError::runtime(format!(
                         "Index out of bounds: string length is {}, index is {}",
                         chars.len(),
                         idx
-                    )))
-                })
+                    )))),
+                }
             }
             Value::Map(items) => {
                 let key = self.expect_map_key(index)?;
-                Ok(items.borrow().get(&key).cloned().unwrap_or(Value::Null))
+                Ok(self.heap.with_map(&items, |m| m.get(&key).cloned().unwrap_or(Value::Null)))
             }
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "Index access expects Array, String, or Map, got {}",
@@ -986,14 +1127,17 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         }
     }
 
-    fn read_field_or_method(&self, object: Value, field: &str) -> RuntimeResult<Value> {
+    fn read_field_or_method(&mut self, object: Value, field: &str) -> RuntimeResult<Value> {
         match object {
             Value::StructInstance(instance) => {
-                if let Some(value) = instance.fields.borrow().get(field).cloned() {
+                let type_name = self.heap.with_struct_instance(&instance, |inst| inst.type_name.clone());
+                let field_value = self.heap.with_struct_instance(&instance, |inst| inst.fields.get(field).cloned());
+
+                if let Some(value) = field_value {
                     return Ok(value);
                 }
 
-                let method = self.env.borrow().get_method(&instance.type_name, field)?;
+                let method = self.env.borrow().get_method(&type_name, field)?;
                 Ok(Value::BoundMethod(crate::environment::BoundMethodValue {
                     receiver: instance,
                     method,
@@ -1025,15 +1169,28 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             TypeAnnotation::Str => matches!(value, Value::String(_)),
             TypeAnnotation::Bool => matches!(value, Value::Bool(_)),
             TypeAnnotation::ArrayOf(inner) => match value {
-                Value::Array(items) => items.borrow().iter().all(|item| self.value_matches_type(inner, item)),
+                Value::Array(items) => {
+                    let items = items.clone();
+                    self.heap.with_array(&items, |arr| {
+                        arr.iter().all(|item| self.value_matches_type(inner, item))
+                    })
+                }
                 _ => false,
             },
             TypeAnnotation::MapOf(inner) => match value {
-                Value::Map(items) => items.borrow().values().all(|item| self.value_matches_type(inner, item)),
+                Value::Map(items) => {
+                    let items = items.clone();
+                    self.heap.with_map(&items, |m| {
+                        m.values().all(|item| self.value_matches_type(inner, item))
+                    })
+                }
                 _ => false,
             },
             TypeAnnotation::Named(name) => match value {
-                Value::StructInstance(instance) => &instance.type_name == name,
+                Value::StructInstance(instance) => {
+                    let instance = instance.clone();
+                    self.heap.with_struct_instance(&instance, |inst| &inst.type_name == name)
+                }
                 _ => false,
             },
         }
@@ -1055,7 +1212,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
 
     fn expect_map_key(&self, value: Value) -> RuntimeResult<String> {
         match value {
-            Value::String(key) => Ok(key),
+            Value::String(key) => Ok(self.heap.get_string(&key)),
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "Map key must be String, got {}",
                 other.type_name_for_error()
@@ -1075,7 +1232,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
 
     fn expect_string(&self, value: Value, label: &str) -> RuntimeResult<String> {
         match value {
-            Value::String(text) => Ok(text),
+            Value::String(text) => Ok(self.heap.get_string(&text)),
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "{label} must be Str, got {}",
                 other.type_name_for_error()
@@ -1085,7 +1242,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
 
     fn expect_array(&self, value: Value, label: &str) -> RuntimeResult<Vec<Value>> {
         match value {
-            Value::Array(items) => Ok(items.borrow().clone()),
+            Value::Array(items) => Ok(self.heap.with_array(&items, |arr| arr.clone())),
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "{label} must be Array, got {}",
                 other.type_name_for_error()
@@ -1116,11 +1273,16 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         }
     }
 
-    fn eval_binary(&self, left: Value, op: BinaryOperator, right: Value) -> RuntimeResult<Value> {
+    fn eval_binary(&mut self, left: Value, op: BinaryOperator, right: Value) -> RuntimeResult<Value> {
         match op {
             BinaryOperator::Add => match (left, right) {
                 (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
-                (Value::String(a), Value::String(b)) => Ok(Value::String(a + &b)),
+                (Value::String(a), Value::String(b)) => {
+                    let sa = self.heap.get_string(&a);
+                    let sb = self.heap.get_string(&b);
+                    let combined = sa + &sb;
+                    Ok(string_value(&mut self.heap, combined))
+                }
                 (a, b) => Err(Signal::Error(TinyLangError::runtime(format!(
                     "Cannot add {} and {}",
                     a.type_name(),
@@ -1143,13 +1305,22 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 }
                 Ok(Value::Int(a % b))
             }
-            BinaryOperator::Eq => Ok(Value::Bool(left == right)),
-            BinaryOperator::Ne => Ok(Value::Bool(left != right)),
+            BinaryOperator::Eq => Ok(Value::Bool(self.values_equal(&left, &right))),
+            BinaryOperator::Ne => Ok(Value::Bool(!self.values_equal(&left, &right))),
             BinaryOperator::Lt => self.eval_int_compare(left, right, |a, b| a < b, "<"),
             BinaryOperator::Gt => self.eval_int_compare(left, right, |a, b| a > b, ">"),
             BinaryOperator::Le => self.eval_int_compare(left, right, |a, b| a <= b, "<="),
             BinaryOperator::Ge => self.eval_int_compare(left, right, |a, b| a >= b, ">="),
             BinaryOperator::And | BinaryOperator::Or => unreachable!(),
+        }
+    }
+
+    fn values_equal(&self, left: &Value, right: &Value) -> bool {
+        match (left, right) {
+            (Value::String(a), Value::String(b)) => {
+                self.heap.get_string(a) == self.heap.get_string(b)
+            }
+            _ => left == right,
         }
     }
 

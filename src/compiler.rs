@@ -9,6 +9,7 @@ use std::rc::Rc;
 use crate::ast::{BinaryOperator, Expr, MatchArm, Pattern, Program, Statement, TypeAnnotation, UnaryOperator};
 use crate::environment::{CompiledFunction, StructDef, Value};
 use crate::error::{Result, TinyLangError};
+use crate::gc::GcHeap;
 
 /// VM 指令集。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,14 +51,39 @@ pub enum OpCode {
 }
 
 /// 編譯結果。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug)]
 pub struct Chunk {
     pub code: Vec<OpCode>,
     pub constants: Vec<Value>,
     pub lines: Vec<usize>,
     pub structs: HashMap<String, StructDef>,
     pub methods: HashMap<String, HashMap<String, Rc<CompiledFunction>>>,
+    pub heap: GcHeap,
 }
+
+impl Default for Chunk {
+    fn default() -> Self {
+        Self {
+            code: Vec::new(),
+            constants: Vec::new(),
+            lines: Vec::new(),
+            structs: HashMap::new(),
+            methods: HashMap::new(),
+            heap: GcHeap::new(),
+        }
+    }
+}
+
+impl PartialEq for Chunk {
+    fn eq(&self, other: &Self) -> bool {
+        self.code == other.code
+            && self.constants == other.constants
+            && self.lines == other.lines
+            && self.structs == other.structs
+    }
+}
+
+impl Eq for Chunk {}
 
 #[derive(Debug, Clone)]
 struct Local {
@@ -73,13 +99,25 @@ struct LoopContext {
 }
 
 /// Slot-based compiler。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Compiler {
     chunk: Chunk,
     locals: Vec<Local>,
     scope_depth: usize,
     loop_stack: Vec<LoopContext>,
     max_local_count: usize,
+}
+
+impl Default for Compiler {
+    fn default() -> Self {
+        Self {
+            chunk: Chunk::default(),
+            locals: Vec::new(),
+            scope_depth: 0,
+            loop_stack: Vec::new(),
+            max_local_count: 0,
+        }
+    }
 }
 
 impl Compiler {
@@ -107,6 +145,7 @@ impl Compiler {
                 lines: Vec::new(),
                 structs: inherited_structs,
                 methods: inherited_methods,
+                heap: GcHeap::new(),
             },
             locals: Vec::new(),
             scope_depth: 1,
@@ -127,6 +166,9 @@ impl Compiler {
         match statement {
             Statement::Import { .. } => Err(TinyLangError::runtime(
                 "bytecode VM does not support import yet; use tree-walking interpreter",
+            )),
+            Statement::EnumDecl { .. } => Err(TinyLangError::runtime(
+                "bytecode VM does not support enum yet; use tree-walking interpreter",
             )),
             Statement::StructDecl { name, fields } => {
                 self.chunk.structs.insert(
@@ -253,7 +295,8 @@ impl Compiler {
                 self.emit(OpCode::Constant(constant));
             }
             Expr::StringLit(value) => {
-                let constant = self.push_constant(Value::String(value.clone()));
+                let str_ref = self.chunk.heap.alloc_string(value.clone());
+                let constant = self.push_constant(Value::String(str_ref));
                 self.emit(OpCode::Constant(constant));
             }
             Expr::BoolLit(value) => {
@@ -329,6 +372,11 @@ impl Compiler {
             Expr::Lambda { .. } => {
                 return Err(TinyLangError::runtime(
                     "bytecode VM does not support lambda/closure yet; use tree-walking interpreter",
+                ));
+            }
+            Expr::EnumVariant { .. } => {
+                return Err(TinyLangError::runtime(
+                    "bytecode VM does not support enum yet; use tree-walking interpreter",
                 ));
             }
         }
@@ -501,7 +549,8 @@ impl Compiler {
                 }
                 Pattern::StringLit(value) => {
                     self.emit(OpCode::GetLocal(match_slot));
-                    let constant = self.push_constant(Value::String(value.clone()));
+                    let str_ref = self.chunk.heap.alloc_string(value.clone());
+                    let constant = self.push_constant(Value::String(str_ref));
                     self.emit(OpCode::Constant(constant));
                     self.emit(OpCode::Equal);
                     let next_arm = self.emit_jump(OpCode::JumpIfFalse(usize::MAX));
@@ -548,6 +597,11 @@ impl Compiler {
                     }
                     self.end_scope();
                     end_jumps.push(self.emit_jump(OpCode::Jump(usize::MAX)));
+                }
+                Pattern::EnumVariant { .. } => {
+                    return Err(TinyLangError::runtime(
+                        "bytecode VM does not support enum pattern matching yet; use tree-walking interpreter",
+                    ));
                 }
             }
         }
@@ -623,7 +677,7 @@ impl Compiler {
     }
 
     fn compile_function(
-        &self,
+        &mut self,
         name: Option<String>,
         params: Vec<(String, Option<TypeAnnotation>)>,
         return_type: Option<TypeAnnotation>,
@@ -639,6 +693,10 @@ impl Compiler {
             self.chunk.methods.clone(),
         );
 
+        // Share the parent heap with the sub-compiler so all string
+        // constants end up in the same GcHeap that the VM will adopt.
+        std::mem::swap(&mut self.chunk.heap, &mut compiler.chunk.heap);
+
         for statement in body {
             compiler.compile_statement(statement)?;
         }
@@ -647,6 +705,9 @@ impl Compiler {
         compiler.emit(OpCode::Constant(null_constant));
         compiler.emit(OpCode::Return);
 
+        // Give the (possibly grown) heap back to the parent compiler.
+        std::mem::swap(&mut self.chunk.heap, &mut compiler.chunk.heap);
+
         Ok(Rc::new(CompiledFunction {
             name,
             params,
@@ -654,6 +715,7 @@ impl Compiler {
             chunk: Rc::new(compiler.chunk),
             local_count: compiler.max_local_count,
             takes_self,
+            capture_names: Vec::new(),
         }))
     }
 

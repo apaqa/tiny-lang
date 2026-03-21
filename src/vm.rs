@@ -2,7 +2,6 @@
 //!
 //! VM 會執行 compiler 產生的 Chunk，並維護 stack 與 call frame。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Stdout, Write};
 use std::rc::Rc;
@@ -10,9 +9,11 @@ use std::rc::Rc;
 use crate::ast::TypeAnnotation;
 use crate::compiler::{Chunk, OpCode};
 use crate::environment::{
-    CompiledFunction, NativeFunction, StructDef, StructInstanceValue, Value, VmBoundMethodValue,
+    array_value, map_value, render_value, string_value, struct_instance_value, CompiledFunction,
+    NativeFunction, StructDef, Value, VmBoundMethodValue,
 };
 use crate::error::{Result, TinyLangError};
+use crate::gc::GcHeap;
 
 /// 呼叫棧上的 frame。
 #[derive(Debug, Clone)]
@@ -30,6 +31,7 @@ pub struct VM<W: Write> {
     structs: HashMap<String, StructDef>,
     methods: HashMap<String, HashMap<String, Rc<CompiledFunction>>>,
     output: W,
+    heap: GcHeap,
 }
 
 impl VM<Stdout> {
@@ -47,17 +49,23 @@ impl<W: Write> VM<W> {
             structs: HashMap::new(),
             methods: HashMap::new(),
             output,
+            heap: GcHeap::new(),
         };
         vm.install_natives();
         vm
     }
 
     /// 執行整個 chunk。
-    pub fn run(&mut self, chunk: Chunk) -> Result<Value> {
+    pub fn run(&mut self, mut chunk: Chunk) -> Result<Value> {
         self.stack.clear();
         self.frames.clear();
         self.structs = chunk.structs.clone();
         self.methods = chunk.methods.clone();
+
+        // Adopt the compiler's heap so string constants remain valid.
+        // Replace the chunk's heap with a fresh one so the Rc<Chunk> can still be formed.
+        let compiler_heap = std::mem::replace(&mut chunk.heap, GcHeap::new());
+        self.heap = compiler_heap;
 
         let script = Rc::new(CompiledFunction {
             name: Some("<script>".into()),
@@ -66,6 +74,7 @@ impl<W: Write> VM<W> {
             chunk: Rc::new(chunk),
             local_count: 0,
             takes_self: false,
+            capture_names: Vec::new(),
         });
 
         self.frames.push(CallFrame {
@@ -146,12 +155,12 @@ impl<W: Write> VM<W> {
                 OpCode::Equal => {
                     let right = self.pop_value()?;
                     let left = self.pop_value()?;
-                    self.stack.push(Value::Bool(left == right));
+                    self.stack.push(Value::Bool(self.values_equal(&left, &right)));
                 }
                 OpCode::NotEqual => {
                     let right = self.pop_value()?;
                     let left = self.pop_value()?;
-                    self.stack.push(Value::Bool(left != right));
+                    self.stack.push(Value::Bool(!self.values_equal(&left, &right)));
                 }
                 OpCode::Less => self.execute_int_compare("<", |a, b| a < b)?,
                 OpCode::Greater => self.execute_int_compare(">", |a, b| a > b)?,
@@ -207,7 +216,8 @@ impl<W: Write> VM<W> {
                 }
                 OpCode::Print => {
                     let value = self.pop_value()?;
-                    writeln!(self.output, "{value}").map_err(|err| TinyLangError::io(err.to_string()))?;
+                    let rendered = render_value(&self.heap, &value);
+                    writeln!(self.output, "{rendered}").map_err(|err| TinyLangError::io(err.to_string()))?;
                 }
                 OpCode::MakeArray(count) => {
                     let mut items = Vec::with_capacity(count);
@@ -215,7 +225,8 @@ impl<W: Write> VM<W> {
                         items.push(self.pop_value()?);
                     }
                     items.reverse();
-                    self.stack.push(Value::Array(Rc::new(RefCell::new(items))));
+                    let arr = array_value(&mut self.heap, items);
+                    self.stack.push(arr);
                 }
                 OpCode::MakeMap(count) => {
                     let mut entries = Vec::with_capacity(count);
@@ -229,7 +240,8 @@ impl<W: Write> VM<W> {
                     for (key, value) in entries {
                         map.insert(key, value);
                     }
-                    self.stack.push(Value::Map(Rc::new(RefCell::new(map))));
+                    let map_val = map_value(&mut self.heap, map);
+                    self.stack.push(map_val);
                 }
                 OpCode::Index => {
                     let index = self.pop_value()?;
@@ -282,10 +294,8 @@ impl<W: Write> VM<W> {
                         fields.insert(field_name.clone(), value);
                     }
 
-                    self.stack.push(Value::StructInstance(StructInstanceValue {
-                        type_name,
-                        fields: Rc::new(RefCell::new(fields)),
-                    }));
+                    let instance = struct_instance_value(&mut self.heap, type_name, fields);
+                    self.stack.push(instance);
                 }
                 OpCode::RuntimeError(message) => return Err(TinyLangError::runtime(message)),
                 OpCode::Halt => return Ok(self.stack.last().cloned().unwrap_or(Value::Null)),
@@ -322,7 +332,13 @@ impl<W: Write> VM<W> {
         let left = self.pop_value()?;
         match (left, right) {
             (Value::Int(a), Value::Int(b)) => self.stack.push(Value::Int(a + b)),
-            (Value::String(a), Value::String(b)) => self.stack.push(Value::String(a + &b)),
+            (Value::String(a), Value::String(b)) => {
+                let sa = self.heap.get_string(&a);
+                let sb = self.heap.get_string(&b);
+                let combined = sa + &sb;
+                let result = string_value(&mut self.heap, combined);
+                self.stack.push(result);
+            }
             (a, b) => {
                 return Err(TinyLangError::runtime(format!(
                     "Cannot add {} and {}",
@@ -451,9 +467,18 @@ impl<W: Write> VM<W> {
     fn execute_native(&mut self, native: NativeFunction, args: &mut [Value]) -> Result<Value> {
         match native {
             NativeFunction::Len => match &args[0] {
-                Value::Array(items) => Ok(Value::Int(items.borrow().len() as i64)),
-                Value::String(text) => Ok(Value::Int(text.chars().count() as i64)),
-                Value::Map(items) => Ok(Value::Int(items.borrow().len() as i64)),
+                Value::Array(items) => {
+                    let items = items.clone();
+                    Ok(Value::Int(self.heap.with_array(&items, |arr| arr.len()) as i64))
+                }
+                Value::String(text) => {
+                    let text = text.clone();
+                    Ok(Value::Int(self.heap.get_string(&text).chars().count() as i64))
+                }
+                Value::Map(items) => {
+                    let items = items.clone();
+                    Ok(Value::Int(self.heap.with_map(&items, |m| m.len()) as i64))
+                }
                 other => Err(TinyLangError::runtime(format!(
                     "Function 'len' expects Array, String, or Map, got {}",
                     other.type_name_for_error()
@@ -461,7 +486,9 @@ impl<W: Write> VM<W> {
             },
             NativeFunction::Push => match &args[0] {
                 Value::Array(items) => {
-                    items.borrow_mut().push(args[1].clone());
+                    let items = items.clone();
+                    let item = args[1].clone();
+                    self.heap.with_array_mut(&items, |arr| arr.push(item));
                     Ok(Value::Null)
                 }
                 other => Err(TinyLangError::runtime(format!(
@@ -470,54 +497,66 @@ impl<W: Write> VM<W> {
                 ))),
             },
             NativeFunction::Pop => match &args[0] {
-                Value::Array(items) => Ok(items.borrow_mut().pop().unwrap_or(Value::Null)),
+                Value::Array(items) => {
+                    let items = items.clone();
+                    Ok(self.heap.with_array_mut(&items, |arr| arr.pop().unwrap_or(Value::Null)))
+                }
                 other => Err(TinyLangError::runtime(format!(
                     "Function 'pop' expects Array, got {}",
                     other.type_name_for_error()
                 ))),
             },
-            NativeFunction::Str => Ok(Value::String(args[0].to_string())),
+            NativeFunction::Str => {
+                let rendered = render_value(&self.heap, &args[0]);
+                Ok(string_value(&mut self.heap, rendered))
+            }
             NativeFunction::Int => self.cast_to_int(&args[0]),
-            NativeFunction::TypeOf => Ok(Value::String(args[0].type_name_for_builtin())),
+            NativeFunction::TypeOf => {
+                let type_name = args[0].type_name_for_builtin();
+                Ok(string_value(&mut self.heap, type_name))
+            }
             NativeFunction::Range => {
                 let start = self.expect_int(args[0].clone(), "range start")?;
                 let end = self.expect_int(args[1].clone(), "range end")?;
                 let items = (start..end).map(Value::Int).collect::<Vec<_>>();
-                Ok(Value::Array(Rc::new(RefCell::new(items))))
+                Ok(array_value(&mut self.heap, items))
             }
         }
     }
 
-    fn read_index(&self, target: Value, index: Value) -> Result<Value> {
+    fn read_index(&mut self, target: Value, index: Value) -> Result<Value> {
         match target {
             Value::Array(items) => {
                 let idx = self.expect_index(index)?;
-                let items = items.borrow();
-                items.get(idx).cloned().ok_or_else(|| {
-                    TinyLangError::runtime(format!(
-                        "Index out of bounds: array length is {}, index is {}",
-                        items.len(),
-                        idx
-                    ))
+                self.heap.with_array(&items, |arr| {
+                    arr.get(idx).cloned().ok_or_else(|| {
+                        TinyLangError::runtime(format!(
+                            "Index out of bounds: array length is {}, index is {}",
+                            arr.len(),
+                            idx
+                        ))
+                    })
                 })
             }
             Value::String(text) => {
                 let idx = self.expect_index(index)?;
-                let chars: Vec<char> = text.chars().collect();
-                chars
-                    .get(idx)
-                    .map(|ch| Value::String(ch.to_string()))
-                    .ok_or_else(|| {
-                        TinyLangError::runtime(format!(
-                            "Index out of bounds: string length is {}, index is {}",
-                            chars.len(),
-                            idx
-                        ))
-                    })
+                let s = self.heap.get_string(&text);
+                let chars: Vec<char> = s.chars().collect();
+                match chars.get(idx) {
+                    Some(ch) => {
+                        let ch_str = ch.to_string();
+                        Ok(string_value(&mut self.heap, ch_str))
+                    }
+                    None => Err(TinyLangError::runtime(format!(
+                        "Index out of bounds: string length is {}, index is {}",
+                        chars.len(),
+                        idx
+                    ))),
+                }
             }
             Value::Map(items) => {
                 let key = self.expect_map_key(index)?;
-                Ok(items.borrow().get(&key).cloned().unwrap_or(Value::Null))
+                Ok(self.heap.with_map(&items, |m| m.get(&key).cloned().unwrap_or(Value::Null)))
             }
             other => Err(TinyLangError::runtime(format!(
                 "Index access expects Array, String, or Map, got {}",
@@ -530,20 +569,24 @@ impl<W: Write> VM<W> {
         match target {
             Value::Array(items) => {
                 let idx = self.expect_index(index)?;
-                let mut items = items.borrow_mut();
-                if idx >= items.len() {
-                    return Err(TinyLangError::runtime(format!(
-                        "Index out of bounds: array length is {}, index is {}",
-                        items.len(),
-                        idx
-                    )));
-                }
-                items[idx] = value;
-                Ok(())
+                self.heap.with_array_mut(&items, |arr| {
+                    if idx >= arr.len() {
+                        Err(TinyLangError::runtime(format!(
+                            "Index out of bounds: array length is {}, index is {}",
+                            arr.len(),
+                            idx
+                        )))
+                    } else {
+                        arr[idx] = value;
+                        Ok(())
+                    }
+                })
             }
             Value::Map(items) => {
                 let key = self.expect_map_key(index)?;
-                items.borrow_mut().insert(key, value);
+                self.heap.with_map_mut(&items, |m| {
+                    m.insert(key, value);
+                });
                 Ok(())
             }
             other => Err(TinyLangError::runtime(format!(
@@ -556,19 +599,22 @@ impl<W: Write> VM<W> {
     fn read_field_or_method(&self, object: Value, field: &str) -> Result<Value> {
         match object {
             Value::StructInstance(instance) => {
-                if let Some(value) = instance.fields.borrow().get(field).cloned() {
+                let type_name = self.heap.with_struct_instance(&instance, |inst| inst.type_name.clone());
+                let field_value = self.heap.with_struct_instance(&instance, |inst| inst.fields.get(field).cloned());
+
+                if let Some(value) = field_value {
                     return Ok(value);
                 }
 
                 let method = self
                     .methods
-                    .get(&instance.type_name)
+                    .get(&type_name)
                     .and_then(|methods| methods.get(field))
                     .cloned()
                     .ok_or_else(|| {
                         TinyLangError::runtime(format!(
                             "Struct '{}' has no field or method '{}'",
-                            instance.type_name, field
+                            type_name, field
                         ))
                     })?;
                 Ok(Value::VmBoundMethod(VmBoundMethodValue {
@@ -586,10 +632,12 @@ impl<W: Write> VM<W> {
     fn assign_field(&mut self, object: Value, field: &str, value: Value) -> Result<()> {
         match object {
             Value::StructInstance(instance) => {
+                let type_name = self.heap.with_struct_instance(&instance, |inst| inst.type_name.clone());
                 let struct_def = self
                     .structs
-                    .get(&instance.type_name)
-                    .ok_or_else(|| TinyLangError::runtime(format!("Struct '{}' not defined", instance.type_name)))?;
+                    .get(&type_name)
+                    .ok_or_else(|| TinyLangError::runtime(format!("Struct '{}' not defined", type_name)))?
+                    .clone();
                 let field_def = struct_def
                     .fields
                     .iter()
@@ -597,13 +645,16 @@ impl<W: Write> VM<W> {
                     .ok_or_else(|| {
                         TinyLangError::runtime(format!(
                             "Struct '{}' has no field '{}'",
-                            instance.type_name, field
+                            type_name, field
                         ))
-                    })?;
+                    })?
+                    .clone();
                 if let Some(annotation) = &field_def.1 {
                     self.ensure_type_matches(annotation, &value)?;
                 }
-                instance.fields.borrow_mut().insert(field.to_string(), value);
+                self.heap.with_struct_instance_mut(&instance, |inst| {
+                    inst.fields.insert(field.to_string(), value);
+                });
                 Ok(())
             }
             other => Err(TinyLangError::runtime(format!(
@@ -632,17 +683,39 @@ impl<W: Write> VM<W> {
             TypeAnnotation::Str => matches!(value, Value::String(_)),
             TypeAnnotation::Bool => matches!(value, Value::Bool(_)),
             TypeAnnotation::ArrayOf(inner) => match value {
-                Value::Array(items) => items.borrow().iter().all(|item| self.value_matches_type(inner, item)),
+                Value::Array(items) => {
+                    let items = items.clone();
+                    self.heap.with_array(&items, |arr| {
+                        arr.iter().all(|item| self.value_matches_type(inner, item))
+                    })
+                }
                 _ => false,
             },
             TypeAnnotation::MapOf(inner) => match value {
-                Value::Map(items) => items.borrow().values().all(|item| self.value_matches_type(inner, item)),
+                Value::Map(items) => {
+                    let items = items.clone();
+                    self.heap.with_map(&items, |m| {
+                        m.values().all(|item| self.value_matches_type(inner, item))
+                    })
+                }
                 _ => false,
             },
             TypeAnnotation::Named(name) => match value {
-                Value::StructInstance(instance) => &instance.type_name == name,
+                Value::StructInstance(instance) => {
+                    let instance = instance.clone();
+                    self.heap.with_struct_instance(&instance, |inst| &inst.type_name == name)
+                }
                 _ => false,
             },
+        }
+    }
+
+    fn values_equal(&self, left: &Value, right: &Value) -> bool {
+        match (left, right) {
+            (Value::String(a), Value::String(b)) => {
+                self.heap.get_string(a) == self.heap.get_string(b)
+            }
+            _ => left == right,
         }
     }
 
@@ -662,7 +735,7 @@ impl<W: Write> VM<W> {
 
     fn expect_map_key(&self, value: Value) -> Result<String> {
         match value {
-            Value::String(text) => Ok(text),
+            Value::String(text) => Ok(self.heap.get_string(&text)),
             other => Err(TinyLangError::runtime(format!(
                 "Map key must be String, got {}",
                 other.type_name_for_error()
@@ -684,10 +757,12 @@ impl<W: Write> VM<W> {
         match value {
             Value::Int(number) => Ok(Value::Int(*number)),
             Value::Bool(flag) => Ok(Value::Int(if *flag { 1 } else { 0 })),
-            Value::String(text) => text
-                .parse::<i64>()
-                .map(Value::Int)
-                .map_err(|_| TinyLangError::runtime(format!("Cannot convert String '{}' to Int", text))),
+            Value::String(text) => {
+                let s = self.heap.get_string(text);
+                s.parse::<i64>()
+                    .map(Value::Int)
+                    .map_err(|_| TinyLangError::runtime(format!("Cannot convert String '{}' to Int", s)))
+            }
             other => Err(TinyLangError::runtime(format!(
                 "Cannot convert {} to Int",
                 other.type_name_for_error()
