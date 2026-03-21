@@ -9,8 +9,10 @@ use std::io::{BufRead, BufReader, Cursor, Stdin, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use crate::ast::{BinaryOperator, Expr, Program, Statement, TypeAnnotation, UnaryOperator};
-use crate::environment::{BuiltinFunction, EnvRef, Environment, FunctionValue, Value};
+use crate::ast::{BinaryOperator, Expr, Pattern, Program, Statement, TypeAnnotation, UnaryOperator};
+use crate::environment::{
+    BuiltinFunction, EnvRef, Environment, FunctionValue, StructDef, StructInstanceValue, Value,
+};
 use crate::error::{Result, TinyLangError};
 
 /// 迴圈與函式共用的控制流程訊號。
@@ -119,6 +121,16 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
     fn execute_statement(&mut self, statement: &Statement) -> RuntimeResult<Value> {
         match statement {
             Statement::Import { path } => self.execute_import(path),
+            Statement::StructDecl { name, fields } => {
+                self.env.borrow_mut().define_struct(
+                    name.clone(),
+                    StructDef {
+                        name: name.clone(),
+                        fields: fields.clone(),
+                    },
+                );
+                Ok(Value::Null)
+            }
             Statement::LetDecl {
                 name,
                 type_annotation,
@@ -147,6 +159,11 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 let value = self.evaluate_expr(value)?;
                 self.assign_index(target_value, index_value, value)
             }
+            Statement::FieldAssignment { object, field, value } => {
+                let object_value = self.evaluate_expr(object)?;
+                let value = self.evaluate_expr(value)?;
+                self.assign_field(object_value, field, value)
+            }
             Statement::FnDecl {
                 name,
                 params,
@@ -161,6 +178,25 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                     closure: self.env.clone(),
                 });
                 self.env.borrow_mut().define(name.clone(), function);
+                Ok(Value::Null)
+            }
+            Statement::MethodDecl {
+                struct_name,
+                method_name,
+                params,
+                body,
+                return_type,
+            } => {
+                let function = FunctionValue {
+                    name: Some(format!("{struct_name}.{method_name}")),
+                    params: params.clone(),
+                    return_type: return_type.clone(),
+                    body: body.clone(),
+                    closure: self.env.clone(),
+                };
+                self.env
+                    .borrow_mut()
+                    .define_method(struct_name.clone(), method_name.clone(), function);
                 Ok(Value::Null)
             }
             Statement::Return(expr) => {
@@ -226,6 +262,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 }
                 Err(other) => Err(other),
             },
+            Statement::Match { expr, arms } => self.execute_match_statement(expr, arms),
             Statement::Print(expr) => {
                 let value = self.evaluate_expr(expr)?;
                 writeln!(self.output, "{value}")
@@ -275,6 +312,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             Expr::StringLit(value) => Ok(Value::String(value.clone())),
             Expr::BoolLit(value) => Ok(Value::Bool(*value)),
             Expr::Ident(name) => Ok(self.env.borrow().get(name)?),
+            Expr::StructInit { name, fields } => self.create_struct_instance(name, fields),
             Expr::ArrayLit(items) => {
                 let mut values = Vec::new();
                 for item in items {
@@ -296,6 +334,10 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 let target_value = self.evaluate_expr(target)?;
                 let index_value = self.evaluate_expr(index)?;
                 self.read_index(target_value, index_value)
+            }
+            Expr::FieldAccess { object, field } => {
+                let object_value = self.evaluate_expr(object)?;
+                self.read_field_or_method(object_value, field)
             }
             Expr::UnaryOp { op, operand } => {
                 let value = self.evaluate_expr(operand)?;
@@ -342,6 +384,13 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
     fn call_value(&mut self, callable: Value, args: &[Expr]) -> RuntimeResult<Value> {
         match callable {
             Value::Function(function) => self.call_user_function(&function, args),
+            Value::BoundMethod(method) => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.evaluate_expr(arg)?);
+                }
+                self.call_method_with_values(&method.method, method.receiver, values)
+            }
             Value::Builtin(builtin) => self.call_builtin(builtin, args),
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "value of type {} is not callable",
@@ -373,6 +422,48 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         values: Vec<Value>,
     ) -> RuntimeResult<Value> {
         let call_env = Environment::enclosed(function.closure.clone());
+        for ((param, annotation), value) in function.params.iter().zip(values.into_iter()) {
+            if let Some(annotation) = annotation {
+                self.ensure_type_matches(annotation, &value)?;
+            }
+            call_env
+                .borrow_mut()
+                .define_typed(param.clone(), value, annotation.clone());
+        }
+
+        let result = match self.execute_block(&function.body, call_env) {
+            Ok(value) => value,
+            Err(Signal::Control(ControlFlow::Return(value))) => value,
+            Err(err) => return Err(err),
+        };
+
+        if let Some(annotation) = &function.return_type {
+            self.ensure_type_matches(annotation, &result)?;
+        }
+
+        Ok(result)
+    }
+
+    fn call_method_with_values(
+        &mut self,
+        function: &FunctionValue,
+        receiver: StructInstanceValue,
+        values: Vec<Value>,
+    ) -> RuntimeResult<Value> {
+        if function.params.len() != values.len() {
+            let name = function.name.as_deref().unwrap_or("<method>");
+            return Err(Signal::Error(TinyLangError::runtime(format!(
+                "Function '{name}' expects {} arguments, got {}",
+                function.params.len(),
+                values.len()
+            ))));
+        }
+
+        let call_env = Environment::enclosed(function.closure.clone());
+        call_env
+            .borrow_mut()
+            .define("self".into(), Value::StructInstance(receiver));
+
         for ((param, annotation), value) in function.params.iter().zip(values.into_iter()) {
             if let Some(annotation) = annotation {
                 self.ensure_type_matches(annotation, &value)?;
@@ -442,7 +533,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             }
             BuiltinFunction::TypeOf => {
                 let values = self.eval_args("typeof", 1, args)?;
-                Ok(Value::String(values[0].type_name_for_builtin().to_string()))
+                Ok(Value::String(values[0].type_name_for_builtin()))
             }
             BuiltinFunction::Input => {
                 let values = self.eval_args("input", 1, args)?;
@@ -728,6 +819,111 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         }
     }
 
+    fn execute_match_statement(&mut self, expr: &Expr, arms: &[crate::ast::MatchArm]) -> RuntimeResult<Value> {
+        let matched_value = self.evaluate_expr(expr)?;
+
+        for arm in arms {
+            if let Some(binding) = self.match_pattern(&arm.pattern, &matched_value) {
+                let match_env = Environment::enclosed(self.env.clone());
+                if let Some((name, value)) = binding {
+                    match_env.borrow_mut().define(name, value);
+                }
+                self.execute_block(&arm.body, match_env)?;
+                return Ok(Value::Null);
+            }
+        }
+
+        Err(Signal::Error(TinyLangError::runtime(
+            "match expression did not match any arm",
+        )))
+    }
+
+    fn match_pattern(&self, pattern: &Pattern, value: &Value) -> Option<Option<(String, Value)>> {
+        match pattern {
+            Pattern::IntLit(expected) => match value {
+                Value::Int(actual) if actual == expected => Some(None),
+                _ => None,
+            },
+            Pattern::StringLit(expected) => match value {
+                Value::String(actual) if actual == expected => Some(None),
+                _ => None,
+            },
+            Pattern::BoolLit(expected) => match value {
+                Value::Bool(actual) if actual == expected => Some(None),
+                _ => None,
+            },
+            Pattern::Ident(name) => Some(Some((name.clone(), value.clone()))),
+            Pattern::Wildcard => Some(None),
+        }
+    }
+
+    fn create_struct_instance(&mut self, name: &str, fields: &[(String, Expr)]) -> RuntimeResult<Value> {
+        let struct_def = self.env.borrow().get_struct(name)?;
+        let mut values = HashMap::new();
+
+        for (field_name, expr) in fields {
+            let value = self.evaluate_expr(expr)?;
+            let expected = struct_def
+                .fields
+                .iter()
+                .find(|(declared_name, _)| declared_name == field_name)
+                .ok_or_else(|| {
+                    Signal::Error(TinyLangError::runtime(format!(
+                        "Struct '{}' has no field '{}'",
+                        name, field_name
+                    )))
+                })?;
+
+            if let Some(annotation) = &expected.1 {
+                self.ensure_type_matches(annotation, &value)?;
+            }
+            values.insert(field_name.clone(), value);
+        }
+
+        for (field_name, _) in &struct_def.fields {
+            if !values.contains_key(field_name) {
+                return Err(Signal::Error(TinyLangError::runtime(format!(
+                    "Struct '{}' initialization missing field '{}'",
+                    name, field_name
+                ))));
+            }
+        }
+
+        Ok(Value::StructInstance(StructInstanceValue {
+            type_name: name.to_string(),
+            fields: Rc::new(RefCell::new(values)),
+        }))
+    }
+
+    fn assign_field(&mut self, object: Value, field: &str, value: Value) -> RuntimeResult<Value> {
+        match object {
+            Value::StructInstance(instance) => {
+                let struct_def = self.env.borrow().get_struct(&instance.type_name)?;
+                let field_def = struct_def
+                    .fields
+                    .iter()
+                    .find(|(name, _)| name == field)
+                    .ok_or_else(|| {
+                        Signal::Error(TinyLangError::runtime(format!(
+                            "Struct '{}' has no field '{}'",
+                            instance.type_name, field
+                        )))
+                    })?;
+
+                if let Some(annotation) = &field_def.1 {
+                    self.ensure_type_matches(annotation, &value)?;
+                }
+
+                instance.fields.borrow_mut().insert(field.to_string(), value);
+                Ok(Value::Null)
+            }
+            other => Err(Signal::Error(TinyLangError::runtime(format!(
+                "Field assignment expects struct instance, got {}",
+                other.type_name_for_error()
+            )))),
+        }
+    }
+
     fn assign_index(&mut self, target: Value, index: Value, value: Value) -> RuntimeResult<Value> {
         match target {
             Value::Array(items) => {
@@ -790,6 +986,26 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         }
     }
 
+    fn read_field_or_method(&self, object: Value, field: &str) -> RuntimeResult<Value> {
+        match object {
+            Value::StructInstance(instance) => {
+                if let Some(value) = instance.fields.borrow().get(field).cloned() {
+                    return Ok(value);
+                }
+
+                let method = self.env.borrow().get_method(&instance.type_name, field)?;
+                Ok(Value::BoundMethod(crate::environment::BoundMethodValue {
+                    receiver: instance,
+                    method,
+                }))
+            }
+            other => Err(Signal::Error(TinyLangError::runtime(format!(
+                "Field access expects struct instance, got {}",
+                other.type_name_for_error()
+            )))),
+        }
+    }
+
     fn ensure_type_matches(&self, annotation: &TypeAnnotation, value: &Value) -> RuntimeResult<()> {
         if self.value_matches_type(annotation, value) {
             Ok(())
@@ -814,6 +1030,10 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             },
             TypeAnnotation::MapOf(inner) => match value {
                 Value::Map(items) => items.borrow().values().all(|item| self.value_matches_type(inner, item)),
+                _ => false,
+            },
+            TypeAnnotation::Named(name) => match value {
+                Value::StructInstance(instance) => &instance.type_name == name,
                 _ => false,
             },
         }

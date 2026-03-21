@@ -1,4 +1,4 @@
-//! Lexer 測試，確認關鍵字與基本符號能正確切詞。
+//! Lexer 測試，確認關鍵字、字面值與符號都能正確切 token。
 
 use tiny_lang::lexer::Lexer;
 use tiny_lang::token::Token;
@@ -37,12 +37,12 @@ fn tokenize_keywords_literals_and_symbols() {
             Token::Semicolon,
             Token::RBrace,
             Token::If,
-            Token::BoolLit(true),
+            Token::True,
             Token::And,
-            Token::BoolLit(false),
+            Token::False,
             Token::Or,
             Token::Not,
-            Token::BoolLit(false),
+            Token::False,
             Token::LBrace,
             Token::Print,
             Token::LParen,
@@ -112,4 +112,22 @@ fn tokenize_import_and_arrow() {
     assert!(tokens.contains(&Token::Import));
     assert!(tokens.contains(&Token::Arrow));
     assert!(tokens.contains(&Token::Colon));
+}
+
+#[test]
+fn tokenize_struct_match_and_dot_tokens() {
+    let source = r#"
+        struct Point { x: int, y: int }
+        let p = new Point { x: 1, y: 2 };
+        p.x = 3;
+        match p.x { 3 => { print("ok"); } _ => { print("no"); } }
+    "#;
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize().unwrap();
+
+    assert!(tokens.contains(&Token::Struct));
+    assert!(tokens.contains(&Token::New));
+    assert!(tokens.contains(&Token::Match));
+    assert!(tokens.contains(&Token::Dot));
+    assert!(tokens.contains(&Token::FatArrow));
 }

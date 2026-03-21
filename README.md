@@ -1,66 +1,69 @@
 # tiny-lang
 
-tiny-lang 是一個用 Rust 實作的教學型直譯語言，目標是用小而清楚的程式碼，展示 lexer、parser、AST、直譯器、型別檢查、模組系統和標準庫如何串在一起。
+tiny-lang 是用 Rust 實作的教學型直譯語言，包含 `lexer`、`parser`、AST、tree-walking interpreter，以及 Phase 5 新增的 bytecode compiler 基礎骨架。
 
-## 語法範例
+## 範例
 
 ```tiny
-import "examples/math_lib.tiny";
+struct Point { x: int, y: int }
 
-let nums: [int] = range(0, 5);
-let doubled = map(nums, |x| x * 2);
-
-fn add(a: int, b: int) -> int {
-    return a + b;
+fn Point.distance(other: Point) -> int {
+    let dx = self.x - other.x;
+    let dy = self.y - other.y;
+    return dx * dx + dy * dy;
 }
 
-for n in doubled {
-    if n == 4 {
-        continue;
-    }
-    print(add(n, square(2)));
-}
+let p = Point { x: 10, y: 20 };
+let q = Point { x: 13, y: 24 };
 
-try {
-    assert(len(doubled) == 5, "length mismatch");
-} catch e {
-    print(e);
+print(p.distance(q));
+
+match p.x {
+    10 => { print("x is ten"); }
+    _ => { print("other"); }
 }
 ```
 
-## 支援功能
+## 功能
 
-- 變數宣告、指定、算術與邏輯運算
+- 變數宣告、指定與運算式求值
 - `if/else`、`while`、`for in`
 - `break`、`continue`、`return`
-- 字串、陣列、Map
-- 函式、匿名函式、箭頭閉包
-- 可選型別標註：`int`、`str`、`bool`、`[type]`、`{type}`、`any`
-- `try/catch` 執行期錯誤處理
-- `import "file.tiny";` 模組載入與重複匯入去重
+- 函式、lambda、closure
+- 陣列與 map
+- 型別註記：`int`、`str`、`bool`、`[type]`、`{type}`、struct 名稱、`any`
+- `try/catch`
+- `import "file.tiny";`
+- `struct` 定義、建立、欄位讀取與欄位修改
+- struct method 與 `self`
+- `match` pattern matching：整數、字串、布林、識別字綁定、`_`
+- bytecode compiler foundation：目前可編譯基礎表達式與簡單 statement，保留後續 VM 擴充空間
 
 ## 內建函式
 
-- 基本：`len`、`push`、`pop`、`str`、`int`、`type_of`、`typeof`、`input`、`range`、`keys`、`values`
-- 數學：`abs`、`max`、`min`、`pow`
+- 集合：`len`、`push`、`pop`、`range`、`keys`、`values`
+- 轉型與輸入：`str`、`int`、`type_of`、`typeof`、`input`
+- 數值：`abs`、`max`、`min`、`pow`
 - 字串：`split`、`join`、`trim`、`upper`、`lower`、`contains`、`replace`
-- 陣列：`sort`、`reverse`、`map`、`filter`、`reduce`、`find`
-- 工具：`assert`
+- 陣列高階函式：`sort`、`reverse`、`map`、`filter`、`reduce`、`find`
+- 驗證：`assert`
 
-## 執行方式
+## 執行
 
 - REPL：`cargo run`
-- 執行檔案：`cargo run -- examples\showcase.tiny`
+- 執行範例：`cargo run -- examples\\showcase.tiny`
 - 測試：`cargo test`
 
-## 範例程式
+## examples
 
-- `examples/hello.tiny`：最小 hello world
-- `examples/fibonacci.tiny`：函式與迴圈
-- `examples/math_lib.tiny`：可被 import 的模組
-- `examples/import_demo.tiny`：匯入示範
-- `examples/showcase.tiny`：語言功能總覽
+- `examples/hello.tiny`
+- `examples/fibonacci.tiny`
+- `examples/math_lib.tiny`
+- `examples/import_demo.tiny`
+- `examples/showcase.tiny`
+- `examples/struct_demo.tiny`
+- `examples/pattern_match.tiny`
 
 ## 測試數量
 
-目前共有 **56** 個測試，涵蓋 lexer、parser、interpreter、型別標註、import、標準庫、closure、Map、for 迴圈與錯誤處理。
+目前共有 **71** 個測試，涵蓋 lexer、parser、interpreter、型別、import、closure、struct、method、match 與其他標準功能。

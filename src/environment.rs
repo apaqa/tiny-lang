@@ -1,6 +1,4 @@
-//! Environment 與執行期值。
-//!
-//! 這裡負責變數作用域、閉包捕獲環境，以及執行期 Value 型別。
+//! 執行環境與執行期值定義。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -9,13 +7,16 @@ use std::rc::Rc;
 use crate::ast::{Statement, TypeAnnotation};
 use crate::error::{Result, TinyLangError};
 
-/// 陣列採共享可變參考，讓函式與閉包能共用同一份資料。
+/// Array 的共享引用。
 pub type ArrayRef = Rc<RefCell<Vec<Value>>>;
 
-/// Map 也採共享可變參考，方便索引寫入與跨作用域共享。
+/// Map 的共享引用。
 pub type MapRef = Rc<RefCell<HashMap<String, Value>>>;
 
-/// 執行期會流動的值。
+/// Struct instance 欄位表的共享引用。
+pub type StructFieldsRef = Rc<RefCell<HashMap<String, Value>>>;
+
+/// 執行期值。
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
@@ -23,19 +24,21 @@ pub enum Value {
     Bool(bool),
     Array(ArrayRef),
     Map(MapRef),
+    StructInstance(StructInstanceValue),
     Function(FunctionValue),
+    BoundMethod(BoundMethodValue),
     Builtin(BuiltinFunction),
     Null,
 }
 
-/// 變數繫結除了值以外，也可帶可選型別標註。
+/// 變數綁定，包含值與可選型別註記。
 #[derive(Debug, Clone)]
 pub struct Binding {
     pub value: Value,
     pub type_annotation: Option<TypeAnnotation>,
 }
 
-/// 使用者定義函式或 lambda 的執行期表示。
+/// 使用者函式或 lambda 的執行期表示。
 #[derive(Debug, Clone)]
 pub struct FunctionValue {
     pub name: Option<String>,
@@ -45,7 +48,28 @@ pub struct FunctionValue {
     pub closure: EnvRef,
 }
 
-/// 內建函式清單。
+/// Struct 定義。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructDef {
+    pub name: String,
+    pub fields: Vec<(String, Option<TypeAnnotation>)>,
+}
+
+/// 執行期 struct instance。
+#[derive(Debug, Clone)]
+pub struct StructInstanceValue {
+    pub type_name: String,
+    pub fields: StructFieldsRef,
+}
+
+/// 綁定 receiver 後的方法值。
+#[derive(Debug, Clone)]
+pub struct BoundMethodValue {
+    pub receiver: StructInstanceValue,
+    pub method: FunctionValue,
+}
+
+/// 內建函式表。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinFunction {
     Len,
@@ -80,9 +104,12 @@ pub enum BuiltinFunction {
 
 pub type EnvRef = Rc<RefCell<Environment>>;
 
+/// 環境同時保存變數、struct 定義與 method 定義。
 #[derive(Debug, Clone)]
 pub struct Environment {
     values: HashMap<String, Binding>,
+    structs: HashMap<String, StructDef>,
+    methods: HashMap<String, HashMap<String, FunctionValue>>,
     parent: Option<EnvRef>,
 }
 
@@ -90,6 +117,8 @@ impl Environment {
     pub fn new() -> EnvRef {
         Rc::new(RefCell::new(Self {
             values: HashMap::new(),
+            structs: HashMap::new(),
+            methods: HashMap::new(),
             parent: None,
         }))
     }
@@ -97,6 +126,8 @@ impl Environment {
     pub fn enclosed(parent: EnvRef) -> EnvRef {
         Rc::new(RefCell::new(Self {
             values: HashMap::new(),
+            structs: HashMap::new(),
+            methods: HashMap::new(),
             parent: Some(parent),
         }))
     }
@@ -151,6 +182,46 @@ impl Environment {
 
         Err(TinyLangError::runtime(format!("Variable '{name}' not defined")))
     }
+
+    pub fn define_struct(&mut self, name: String, def: StructDef) {
+        self.structs.insert(name, def);
+    }
+
+    pub fn get_struct(&self, name: &str) -> Result<StructDef> {
+        if let Some(def) = self.structs.get(name) {
+            return Ok(def.clone());
+        }
+
+        if let Some(parent) = &self.parent {
+            return parent.borrow().get_struct(name);
+        }
+
+        Err(TinyLangError::runtime(format!("Struct '{name}' not defined")))
+    }
+
+    pub fn define_method(&mut self, struct_name: String, method_name: String, method: FunctionValue) {
+        self.methods
+            .entry(struct_name)
+            .or_default()
+            .insert(method_name, method);
+    }
+
+    pub fn get_method(&self, struct_name: &str, method_name: &str) -> Result<FunctionValue> {
+        if let Some(methods) = self.methods.get(struct_name) {
+            if let Some(method) = methods.get(method_name) {
+                return Ok(method.clone());
+            }
+        }
+
+        if let Some(parent) = &self.parent {
+            return parent.borrow().get_method(struct_name, method_name);
+        }
+
+        Err(TinyLangError::runtime(format!(
+            "Method '{}.{}' not defined",
+            struct_name, method_name
+        )))
+    }
 }
 
 impl Value {
@@ -161,7 +232,8 @@ impl Value {
             Value::String(value) => !value.is_empty(),
             Value::Array(items) => !items.borrow().is_empty(),
             Value::Map(items) => !items.borrow().is_empty(),
-            Value::Function(_) | Value::Builtin(_) => true,
+            Value::StructInstance(_) => true,
+            Value::Function(_) | Value::BoundMethod(_) | Value::Builtin(_) => true,
             Value::Null => false,
         }
     }
@@ -173,24 +245,26 @@ impl Value {
             Value::Bool(_) => "Bool",
             Value::Array(_) => "Array",
             Value::Map(_) => "Map",
-            Value::Function(_) | Value::Builtin(_) => "Function",
+            Value::StructInstance(_) => "Struct",
+            Value::Function(_) | Value::BoundMethod(_) | Value::Builtin(_) => "Function",
             Value::Null => "Null",
         }
     }
 
-    pub fn type_name_for_builtin(&self) -> &'static str {
+    pub fn type_name_for_builtin(&self) -> String {
         match self {
-            Value::Int(_) => "int",
-            Value::String(_) => "string",
-            Value::Bool(_) => "bool",
-            Value::Array(_) => "array",
-            Value::Map(_) => "map",
-            Value::Function(_) | Value::Builtin(_) => "function",
-            Value::Null => "null",
+            Value::Int(_) => "int".into(),
+            Value::String(_) => "string".into(),
+            Value::Bool(_) => "bool".into(),
+            Value::Array(_) => "array".into(),
+            Value::Map(_) => "map".into(),
+            Value::StructInstance(instance) => instance.type_name.clone(),
+            Value::Function(_) | Value::BoundMethod(_) | Value::Builtin(_) => "function".into(),
+            Value::Null => "null".into(),
         }
     }
 
-    /// 將值轉成使用者錯誤訊息使用的型別名稱。
+    /// 給錯誤訊息使用的型別名稱。
     pub fn type_name_for_error(&self) -> String {
         match self {
             Value::Int(_) => "int".into(),
@@ -212,7 +286,8 @@ impl Value {
                     "{any}".into()
                 }
             }
-            Value::Function(_) | Value::Builtin(_) => "function".into(),
+            Value::StructInstance(instance) => instance.type_name.clone(),
+            Value::Function(_) | Value::BoundMethod(_) | Value::Builtin(_) => "function".into(),
             Value::Null => "null".into(),
         }
     }
@@ -229,6 +304,22 @@ impl PartialEq for FunctionValue {
 
 impl Eq for FunctionValue {}
 
+impl PartialEq for StructInstanceValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.type_name == other.type_name && *self.fields.borrow() == *other.fields.borrow()
+    }
+}
+
+impl Eq for StructInstanceValue {}
+
+impl PartialEq for BoundMethodValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.receiver == other.receiver && self.method == other.method
+    }
+}
+
+impl Eq for BoundMethodValue {}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -238,8 +329,10 @@ impl PartialEq for Value {
             (Value::Null, Value::Null) => true,
             (Value::Array(a), Value::Array(b)) => *a.borrow() == *b.borrow(),
             (Value::Map(a), Value::Map(b)) => *a.borrow() == *b.borrow(),
+            (Value::StructInstance(a), Value::StructInstance(b)) => a == b,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Function(a), Value::Function(b)) => a == b,
+            (Value::BoundMethod(a), Value::BoundMethod(b)) => a == b,
             _ => false,
         }
     }
@@ -271,9 +364,23 @@ impl std::fmt::Display for Value {
                 entries.sort();
                 write!(f, "{{{}}}", entries.join(", "))
             }
+            Value::StructInstance(instance) => {
+                let mut entries = instance
+                    .fields
+                    .borrow()
+                    .iter()
+                    .map(|(key, value)| format!("{key}: {value}"))
+                    .collect::<Vec<_>>();
+                entries.sort();
+                write!(f, "{} {{ {} }}", instance.type_name, entries.join(", "))
+            }
             Value::Function(function) => match &function.name {
                 Some(name) => write!(f, "<fn {name}>"),
                 None => write!(f, "<lambda>"),
+            },
+            Value::BoundMethod(method) => match &method.method.name {
+                Some(name) => write!(f, "<bound {name}>"),
+                None => write!(f, "<bound method>"),
             },
             Value::Builtin(_) => write!(f, "<builtin>"),
             Value::Null => write!(f, "null"),

@@ -1,7 +1,4 @@
-//! Lexer 實作。
-//!
-//! 這一層把原始碼切成 token，並保留行列資訊，
-//! 讓 parser 與錯誤訊息可以精準指出位置。
+//! Lexer：把原始碼切成 token。
 
 use crate::error::{Result, TinyLangError};
 use crate::token::{Span, SpannedToken, Token};
@@ -23,13 +20,13 @@ impl Lexer {
         }
     }
 
-    /// 將輸入切成不帶位置資訊的 token，供舊測試或簡化流程使用。
+    /// 只回傳 token，不帶位置。
     pub fn tokenize(&mut self) -> Result<Vec<Token>> {
         let spanned = self.tokenize_with_spans()?;
         Ok(spanned.into_iter().map(|item| item.token).collect())
     }
 
-    /// 將輸入切成帶位置資訊的 token 串。
+    /// 回傳帶位置資訊的 token 流。
     pub fn tokenize_with_spans(&mut self) -> Result<Vec<SpannedToken>> {
         let mut tokens = Vec::new();
 
@@ -56,7 +53,8 @@ impl Lexer {
                 ',' => tokens.push(self.single_char(Token::Comma)),
                 ';' => tokens.push(self.single_char(Token::Semicolon)),
                 ':' => tokens.push(self.single_char(Token::Colon)),
-                '=' => tokens.push(self.read_two_char(Token::Assign, '=', Token::Eq)),
+                '.' => tokens.push(self.single_char(Token::Dot)),
+                '=' => tokens.push(self.read_equals_assign_or_fat_arrow()),
                 '!' => tokens.push(self.read_two_char(Token::Not, '=', Token::Ne)),
                 '<' => tokens.push(self.read_two_char(Token::Lt, '=', Token::Le)),
                 '>' => tokens.push(self.read_two_char(Token::Gt, '=', Token::Ge)),
@@ -118,6 +116,19 @@ impl Lexer {
             Token::Arrow
         } else {
             Token::Minus
+        };
+        SpannedToken { token, span }
+    }
+
+    fn read_equals_assign_or_fat_arrow(&mut self) -> SpannedToken {
+        let span = self.current_span();
+        self.advance();
+        let token = if self.match_char('=') {
+            Token::Eq
+        } else if self.match_char('>') {
+            Token::FatArrow
+        } else {
+            Token::Assign
         };
         SpannedToken { token, span }
     }
@@ -233,6 +244,9 @@ impl Lexer {
         let token = match ident.as_str() {
             "let" => Token::Let,
             "fn" => Token::Fn,
+            "struct" => Token::Struct,
+            "new" => Token::New,
+            "match" => Token::Match,
             "return" => Token::Return,
             "if" => Token::If,
             "else" => Token::Else,
@@ -245,8 +259,8 @@ impl Lexer {
             "catch" => Token::Catch,
             "import" => Token::Import,
             "print" => Token::Print,
-            "true" => Token::BoolLit(true),
-            "false" => Token::BoolLit(false),
+            "true" => Token::True,
+            "false" => Token::False,
             _ => Token::Ident(ident),
         };
 

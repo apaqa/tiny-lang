@@ -1,9 +1,8 @@
 //! Token 定義。
 //!
-//! 這個檔案集中 tiny-lang 的詞彙單位，供 lexer 產生、
-//! parser 消費，並讓錯誤訊息可以攜帶對應位置。
+//! lexer 會把原始碼切成 token，parser 再把 token 串接成 AST。
 
-/// 原始碼中的行列位置。
+/// 原始碼位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     pub line: usize,
@@ -23,11 +22,14 @@ pub struct SpannedToken {
     pub span: Span,
 }
 
-/// tiny-lang 的所有 token 種類。
+/// tiny-lang 的 token 集合。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Let,
     Fn,
+    Struct,
+    New,
+    Match,
     Return,
     If,
     Else,
@@ -59,11 +61,13 @@ pub enum Token {
     Ge,
     Assign,
     Arrow,
+    FatArrow,
     And,
     Or,
     Not,
     Pipe,
     Colon,
+    Dot,
     LParen,
     RParen,
     LBrace,

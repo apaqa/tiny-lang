@@ -1,0 +1,16 @@
+// Phase 5：struct 與 method 範例
+struct Point { x: int, y: int }
+
+fn Point.distance(other: Point) -> int {
+    let dx = self.x - other.x;
+    let dy = self.y - other.y;
+    return dx * dx + dy * dy;
+}
+
+let p = Point { x: 10, y: 20 };
+let q = Point { x: 13, y: 24 };
+
+print(p.x);
+p.x = 30;
+print(p.x);
+print(p.distance(q));

@@ -1,12 +1,12 @@
 //! 抽象語法樹（AST）定義。
 //!
-//! parser 會把 token 串整理成 AST，
-//! interpreter 再依照這裡的結構執行程式。
+//! parser 會把 token 流轉成 AST，
+//! interpreter 與之後的 compiler 會基於這些節點工作。
 
-/// 整份程式就是 statement 的列表。
+/// 整份 tiny-lang 程式。
 pub type Program = Vec<Statement>;
 
-/// 可用於可選型別標註的型別節點。
+/// 型別註記。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeAnnotation {
     Int,
@@ -14,11 +14,12 @@ pub enum TypeAnnotation {
     Bool,
     ArrayOf(Box<TypeAnnotation>),
     MapOf(Box<TypeAnnotation>),
+    Named(String),
     Any,
 }
 
 impl TypeAnnotation {
-    /// 產生使用者可讀的型別名稱。
+    /// 轉成人類可讀的型別名稱，用於錯誤訊息。
     pub fn display_name(&self) -> String {
         match self {
             TypeAnnotation::Int => "int".into(),
@@ -26,27 +27,51 @@ impl TypeAnnotation {
             TypeAnnotation::Bool => "bool".into(),
             TypeAnnotation::ArrayOf(inner) => format!("[{}]", inner.display_name()),
             TypeAnnotation::MapOf(inner) => format!("{{{}}}", inner.display_name()),
+            TypeAnnotation::Named(name) => name.clone(),
             TypeAnnotation::Any => "any".into(),
         }
     }
 }
 
-/// 可執行的敘述節點。
+/// 陳述式節點。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Import { path: String },
+    StructDecl {
+        name: String,
+        fields: Vec<(String, Option<TypeAnnotation>)>,
+    },
     LetDecl {
         name: String,
         type_annotation: Option<TypeAnnotation>,
         value: Expr,
     },
-    Assignment { name: String, value: Expr },
-    IndexAssignment { target: Expr, index: Expr, value: Expr },
+    Assignment {
+        name: String,
+        value: Expr,
+    },
+    IndexAssignment {
+        target: Expr,
+        index: Expr,
+        value: Expr,
+    },
+    FieldAssignment {
+        object: Box<Expr>,
+        field: String,
+        value: Expr,
+    },
     FnDecl {
         name: String,
         params: Vec<(String, Option<TypeAnnotation>)>,
         return_type: Option<TypeAnnotation>,
         body: Vec<Statement>,
+    },
+    MethodDecl {
+        struct_name: String,
+        method_name: String,
+        params: Vec<(String, Option<TypeAnnotation>)>,
+        body: Vec<Statement>,
+        return_type: Option<TypeAnnotation>,
     },
     Return(Expr),
     IfElse {
@@ -70,22 +95,34 @@ pub enum Statement {
         catch_var: String,
         catch_body: Vec<Statement>,
     },
+    Match {
+        expr: Expr,
+        arms: Vec<MatchArm>,
+    },
     Print(Expr),
     ExprStatement(Expr),
 }
 
-/// 可計算出值的表達式節點。
+/// 表達式節點。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     IntLit(i64),
     StringLit(String),
     BoolLit(bool),
     Ident(String),
+    StructInit {
+        name: String,
+        fields: Vec<(String, Expr)>,
+    },
     ArrayLit(Vec<Expr>),
     MapLit(Vec<(Expr, Expr)>),
     IndexAccess {
         target: Box<Expr>,
         index: Box<Expr>,
+    },
+    FieldAccess {
+        object: Box<Expr>,
+        field: String,
     },
     BinaryOp {
         left: Box<Expr>,
@@ -104,6 +141,23 @@ pub enum Expr {
         params: Vec<String>,
         body: Vec<Statement>,
     },
+}
+
+/// match arm。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Vec<Statement>,
+}
+
+/// match 使用的 pattern。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    IntLit(i64),
+    StringLit(String),
+    BoolLit(bool),
+    Ident(String),
+    Wildcard,
 }
 
 /// 二元運算子。
