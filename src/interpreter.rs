@@ -65,6 +65,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         let env = Environment::new();
         install_builtins(&env);
         install_builtin_interfaces(&env);
+        install_builtin_enums(&env);
         Self {
             env,
             output,
@@ -205,6 +206,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             }
             Statement::FnDecl {
                 name,
+                type_params: _,
                 params,
                 return_type,
                 body,
@@ -956,9 +958,9 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         let matched_value = self.evaluate_expr(expr)?;
 
         for arm in arms {
-            if let Some(binding) = self.match_pattern(&arm.pattern, &matched_value) {
+            if let Some(bindings) = self.match_pattern(&arm.pattern, &matched_value) {
                 let match_env = Environment::enclosed(self.env.clone());
-                if let Some((name, value)) = binding {
+                for (name, value) in bindings {
                     match_env.borrow_mut().define(name, value);
                 }
                 self.execute_block(&arm.body, match_env)?;
@@ -971,17 +973,17 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         )))
     }
 
-    fn match_pattern(&self, pattern: &Pattern, value: &Value) -> Option<Option<(String, Value)>> {
+    fn match_pattern(&self, pattern: &Pattern, value: &Value) -> Option<Vec<(String, Value)>> {
         match pattern {
             Pattern::IntLit(expected) => match value {
-                Value::Int(actual) if actual == expected => Some(None),
+                Value::Int(actual) if actual == expected => Some(Vec::new()),
                 _ => None,
             },
             Pattern::StringLit(expected) => match value {
                 Value::String(actual) => {
                     let actual_str = self.heap.get_string(actual);
                     if &actual_str == expected {
-                        Some(None)
+                        Some(Vec::new())
                     } else {
                         None
                     }
@@ -989,29 +991,47 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 _ => None,
             },
             Pattern::BoolLit(expected) => match value {
-                Value::Bool(actual) if actual == expected => Some(None),
+                Value::Bool(actual) if actual == expected => Some(Vec::new()),
                 _ => None,
             },
-            Pattern::Ident(name) => Some(Some((name.clone(), value.clone()))),
-            Pattern::Wildcard => Some(None),
+            Pattern::Ident(name) => Some(vec![(name.clone(), value.clone())]),
+            Pattern::Wildcard => Some(Vec::new()),
             Pattern::EnumVariant { enum_name, variant, bindings } => match value {
                 Value::EnumVariant(reference) => {
                     let ev = self.heap.get_enum_variant(reference);
                     if ev.enum_name != *enum_name || ev.variant_name != *variant {
                         return None;
                     }
-                    if let Some(binding_names) = bindings {
-                        // Return first binding (simplified: bind whole variant for now)
-                        if binding_names.is_empty() {
-                            Some(None)
-                        } else {
-                            // Bind field values by position
-                            // For simplicity, just bind whole value to first name
-                            Some(Some((binding_names[0].clone(), value.clone())))
-                        }
-                    } else {
-                        Some(None)
+                    let Some(binding_names) = bindings else {
+                        return Some(Vec::new());
+                    };
+                    if binding_names.is_empty() {
+                        return Some(Vec::new());
                     }
+
+                    // 中文註解：tuple-like variant 以 0、1、2... 排序，named variant 則優先同名取值。
+                    let mut ordered_fields: Vec<(String, Value)> = ev
+                        .fields
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect();
+                    ordered_fields.sort_by(|(left, _), (right, _)| compare_variant_field_names(left, right));
+
+                    if binding_names.len() > ordered_fields.len() {
+                        return None;
+                    }
+
+                    let mut resolved = Vec::new();
+                    for (index, binding_name) in binding_names.iter().enumerate() {
+                        if let Some(value) = ev.fields.get(binding_name).cloned() {
+                            resolved.push((binding_name.clone(), value));
+                        } else if let Some((_, value)) = ordered_fields.get(index) {
+                            resolved.push((binding_name.clone(), value.clone()));
+                        } else {
+                            return None;
+                        }
+                    }
+                    Some(resolved)
                 }
                 _ => None,
             },
@@ -1059,12 +1079,40 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         variant_name: &str,
         fields: Option<&[(String, Expr)]>,
     ) -> RuntimeResult<Value> {
+        let enum_def = self.env.borrow().get_enum(enum_name)?;
+        let variant_def = enum_def
+            .variants
+            .iter()
+            .find(|variant| variant.name == variant_name)
+            .ok_or_else(|| {
+                Signal::Error(TinyLangError::runtime(format!(
+                    "Enum '{}::{}' not defined",
+                    enum_name, variant_name
+                )))
+            })?;
+
         let mut values = std::collections::HashMap::new();
-        if let Some(fields) = fields {
-            for (field_name, expr) in fields {
-                let value = self.evaluate_expr(expr)?;
-                values.insert(field_name.clone(), value);
+        let incoming_fields = fields.unwrap_or(&[]);
+        let expected_fields = variant_def.fields.clone().unwrap_or_default();
+        if incoming_fields.len() != expected_fields.len() {
+            return Err(Signal::Error(TinyLangError::runtime(format!(
+                "Enum '{}::{}' expects {} field(s), got {}",
+                enum_name,
+                variant_name,
+                expected_fields.len(),
+                incoming_fields.len()
+            ))));
+        }
+
+        for ((actual_name, expr), (expected_name, _)) in incoming_fields.iter().zip(expected_fields.iter()) {
+            if actual_name != expected_name {
+                return Err(Signal::Error(TinyLangError::runtime(format!(
+                    "Enum '{}::{}' expects field '{}', got '{}'",
+                    enum_name, variant_name, expected_name, actual_name
+                ))));
             }
+            let value = self.evaluate_expr(expr)?;
+            values.insert(actual_name.clone(), value);
         }
         Ok(enum_variant_value(&mut self.heap, enum_name.to_string(), variant_name.to_string(), values))
     }
@@ -1248,6 +1296,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 _ => false,
             },
             TypeAnnotation::Named(name) => match value {
+                _ if is_runtime_generic_type_name(name) => true,
                 Value::StructInstance(instance) => {
                     let instance = instance.clone();
                     self.heap.with_struct_instance(&instance, |inst| {
@@ -1255,11 +1304,27 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                             || (self.env.borrow().has_interface(name)
                                 && self
                                     .env
-                                    .borrow()
-                                    .struct_implements_interface(&inst.type_name, name))
+                                .borrow()
+                                .struct_implements_interface(&inst.type_name, name))
                     })
                 }
+                Value::EnumVariant(reference) => {
+                    let reference = reference.clone();
+                    self.heap.with_enum_variant(&reference, |variant| &variant.enum_name == name)
+                }
                 _ => false,
+            },
+            TypeAnnotation::Generic { name, type_params } => match name.as_str() {
+                // 中文註解：runtime 對泛型做型別擦除，僅保留容器/enum 本體檢查。
+                "Array" if type_params.len() == 1 => self.value_matches_type(&TypeAnnotation::ArrayOf(Box::new(type_params[0].clone())), value),
+                "Map" if type_params.len() == 1 => self.value_matches_type(&TypeAnnotation::MapOf(Box::new(type_params[0].clone())), value),
+                _ => match value {
+                    Value::EnumVariant(reference) => {
+                        let reference = reference.clone();
+                        self.heap.with_enum_variant(&reference, |variant| &variant.enum_name == name)
+                    }
+                    _ => false,
+                },
             },
         }
     }
@@ -1276,6 +1341,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         for method in methods {
             let Statement::FnDecl {
                 name,
+                type_params: _,
                 params,
                 return_type,
                 body,
@@ -1561,4 +1627,53 @@ fn install_builtin_interfaces(env: &EnvRef) {
             }],
         },
     );
+}
+
+fn install_builtin_enums(env: &EnvRef) {
+    use crate::environment::EnumVariantDef;
+
+    env.borrow_mut().define_enum(
+        "Option".into(),
+        EnumDef {
+            name: "Option".into(),
+            variants: vec![
+                EnumVariantDef {
+                    name: "Some".into(),
+                    fields: Some(vec![("0".into(), Some(TypeAnnotation::Named("T".into())))]),
+                },
+                EnumVariantDef {
+                    name: "None".into(),
+                    fields: Some(vec![]),
+                },
+            ],
+        },
+    );
+
+    env.borrow_mut().define_enum(
+        "Result".into(),
+        EnumDef {
+            name: "Result".into(),
+            variants: vec![
+                EnumVariantDef {
+                    name: "Ok".into(),
+                    fields: Some(vec![("0".into(), Some(TypeAnnotation::Named("T".into())))]),
+                },
+                EnumVariantDef {
+                    name: "Err".into(),
+                    fields: Some(vec![("0".into(), Some(TypeAnnotation::Named("E".into())))]),
+                },
+            ],
+        },
+    );
+}
+
+fn compare_variant_field_names(left: &str, right: &str) -> std::cmp::Ordering {
+    match (left.parse::<usize>(), right.parse::<usize>()) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        _ => left.cmp(right),
+    }
+}
+
+fn is_runtime_generic_type_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|ch| ch.is_ascii_uppercase())
 }

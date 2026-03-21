@@ -129,6 +129,7 @@ impl Parser {
             let body = self.parse_block()?;
             methods.push(Statement::FnDecl {
                 name,
+                type_params: Vec::new(),
                 params,
                 return_type,
                 body,
@@ -201,6 +202,7 @@ impl Parser {
     fn parse_fn_or_method_decl(&mut self) -> Result<Statement> {
         self.expect_token(Token::Fn)?;
         let first_name = self.consume_ident()?;
+        let type_params = self.parse_optional_type_params()?;
 
         if self.match_token(&Token::Dot) {
             let method_name = self.consume_ident()?;
@@ -229,6 +231,7 @@ impl Parser {
         let body = self.parse_block()?;
         Ok(Statement::FnDecl {
             name: first_name,
+            type_params,
             params,
             return_type,
             body,
@@ -440,6 +443,22 @@ impl Parser {
         Ok(params)
     }
 
+    fn parse_optional_type_params(&mut self) -> Result<Vec<String>> {
+        if !self.match_token(&Token::Lt) {
+            return Ok(Vec::new());
+        }
+
+        let mut type_params = Vec::new();
+        loop {
+            type_params.push(self.consume_ident()?);
+            if !self.match_token(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect_token(Token::Gt)?;
+        Ok(type_params)
+    }
+
     fn parse_lambda_pipe_params(&mut self) -> Result<Vec<String>> {
         self.expect_token(Token::Pipe)?;
         let mut params = Vec::new();
@@ -463,7 +482,21 @@ impl Parser {
                 "str" => Ok(TypeAnnotation::Str),
                 "bool" => Ok(TypeAnnotation::Bool),
                 "any" => Ok(TypeAnnotation::Any),
-                _ => Ok(TypeAnnotation::Named(name)),
+                _ => {
+                    if self.match_token(&Token::Lt) {
+                        let mut type_params = Vec::new();
+                        loop {
+                            type_params.push(self.parse_type_annotation()?);
+                            if !self.match_token(&Token::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect_token(Token::Gt)?;
+                        Ok(TypeAnnotation::Generic { name, type_params })
+                    } else {
+                        Ok(TypeAnnotation::Named(name))
+                    }
+                }
             },
             Token::LBracket => {
                 let inner = self.parse_type_annotation()?;
@@ -701,6 +734,22 @@ impl Parser {
                 }
             }
             self.expect_token(Token::RBrace)?;
+            Some(fields)
+        } else if self.match_token(&Token::LParen) {
+            // 中文註解：tuple-like enum variant 以 0、1、2... 當作內部欄位名稱。
+            let mut fields = Vec::new();
+            let mut index = 0;
+            if !self.check(&Token::RParen) {
+                loop {
+                    let value = self.parse_expression()?;
+                    fields.push((index.to_string(), value));
+                    index += 1;
+                    if !self.match_token(&Token::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect_token(Token::RParen)?;
             Some(fields)
         } else {
             None

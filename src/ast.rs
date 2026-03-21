@@ -12,6 +12,11 @@ pub enum TypeAnnotation {
     ArrayOf(Box<TypeAnnotation>),
     MapOf(Box<TypeAnnotation>),
     Named(String),
+    // 中文註解：Generic 代表像 Array<int>、Option<T> 這種帶型別參數的型別。
+    Generic {
+        name: String,
+        type_params: Vec<TypeAnnotation>,
+    },
     Any,
 }
 
@@ -24,6 +29,15 @@ impl TypeAnnotation {
             TypeAnnotation::ArrayOf(inner) => format!("[{}]", inner.display_name()),
             TypeAnnotation::MapOf(inner) => format!("{{{}}}", inner.display_name()),
             TypeAnnotation::Named(name) => name.clone(),
+            TypeAnnotation::Generic { name, type_params } => format!(
+                "{}<{}>",
+                name,
+                type_params
+                    .iter()
+                    .map(TypeAnnotation::display_name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             TypeAnnotation::Any => "any".into(),
         }
     }
@@ -86,6 +100,8 @@ pub enum Statement {
     },
     FnDecl {
         name: String,
+        // 中文註解：函式自己的泛型參數名稱，例如 fn first<T>(...)。
+        type_params: Vec<String>,
         params: Vec<(String, Option<TypeAnnotation>)>,
         return_type: Option<TypeAnnotation>,
         body: Vec<Statement>,

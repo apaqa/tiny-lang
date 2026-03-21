@@ -168,12 +168,18 @@ impl Formatter {
             }
             Statement::FnDecl {
                 name,
+                type_params,
                 params,
                 return_type,
                 body,
             } => {
                 self.output.push_str("fn ");
                 self.output.push_str(name);
+                if !type_params.is_empty() {
+                    self.output.push('<');
+                    self.output.push_str(&type_params.join(", "));
+                    self.output.push('>');
+                }
                 self.write_function_signature(params, return_type);
                 self.output.push(' ');
                 self.write_block(body);
@@ -352,6 +358,14 @@ impl Formatter {
                 variant,
                 fields,
             } => match fields {
+                Some(fields) if !fields.is_empty() && self.enum_variant_uses_tuple_style(fields) => {
+                    let items = fields
+                        .iter()
+                        .map(|(_, value)| self.format_expr(value))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{enum_name}::{variant}({items})")
+                }
                 Some(fields) if !fields.is_empty() => {
                     let items = fields
                         .iter()
@@ -451,6 +465,15 @@ impl Formatter {
             TypeAnnotation::ArrayOf(inner) => format!("[{}]", self.format_type(inner)),
             TypeAnnotation::MapOf(inner) => format!("{{{}}}", self.format_type(inner)),
             TypeAnnotation::Named(name) => name.clone(),
+            TypeAnnotation::Generic { name, type_params } => format!(
+                "{}<{}>",
+                name,
+                type_params
+                    .iter()
+                    .map(|param| self.format_type(param))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             TypeAnnotation::Any => "any".into(),
         }
     }
@@ -505,5 +528,12 @@ impl Formatter {
             .replace('\r', "\\r")
             .replace('\t', "\\t");
         format!("\"{escaped}\"")
+    }
+
+    fn enum_variant_uses_tuple_style(&self, fields: &[(String, Expr)]) -> bool {
+        fields
+            .iter()
+            .enumerate()
+            .all(|(index, (name, _))| name == &index.to_string())
     }
 }

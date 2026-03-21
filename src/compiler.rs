@@ -248,6 +248,7 @@ impl Compiler {
                 for method in methods {
                     let Statement::FnDecl {
                         name,
+                        type_params: _,
                         params,
                         return_type,
                         body,
@@ -349,6 +350,7 @@ impl Compiler {
             }
             Statement::FnDecl {
                 name,
+                type_params: _,
                 params,
                 return_type,
                 body,

@@ -61,6 +61,10 @@ impl VM<Stdout> {
     }
 }
 
+fn is_runtime_generic_type_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|ch| ch.is_ascii_uppercase())
+}
+
 impl<W: Write> VM<W> {
     pub fn with_output(output: W) -> Self {
         let mut vm = Self {
@@ -1076,11 +1080,32 @@ impl<W: Write> VM<W> {
                 _ => false,
             },
             TypeAnnotation::Named(name) => match value {
+                _ if is_runtime_generic_type_name(name) => true,
                 Value::StructInstance(instance) => {
                     let instance = instance.clone();
                     self.heap.with_struct_instance(&instance, |inst| &inst.type_name == name)
                 }
+                Value::EnumVariant(reference) => {
+                    let reference = reference.clone();
+                    self.heap.with_enum_variant(&reference, |variant| &variant.enum_name == name)
+                }
                 _ => false,
+            },
+            TypeAnnotation::Generic { name, type_params } => match name.as_str() {
+                // 中文註解：VM 對泛型一樣採型別擦除，只檢查容器或 enum 本體。
+                "Array" if type_params.len() == 1 => {
+                    self.value_matches_type(&TypeAnnotation::ArrayOf(Box::new(type_params[0].clone())), value)
+                }
+                "Map" if type_params.len() == 1 => {
+                    self.value_matches_type(&TypeAnnotation::MapOf(Box::new(type_params[0].clone())), value)
+                }
+                _ => match value {
+                    Value::EnumVariant(reference) => {
+                        let reference = reference.clone();
+                        self.heap.with_enum_variant(&reference, |variant| &variant.enum_name == name)
+                    }
+                    _ => false,
+                },
             },
         }
     }
