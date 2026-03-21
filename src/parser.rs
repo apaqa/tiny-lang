@@ -573,6 +573,8 @@ impl Parser {
         match self.peek().token.clone() {
             Token::Fn => self.parse_fn_lambda(),
             Token::Pipe => self.parse_pipe_lambda(),
+            // `||` 被 lexer 解析為 Token::Or，這裡視為空參數 lambda
+            Token::Or => self.parse_empty_lambda(),
             Token::New => self.parse_new_struct_init(),
             _ => {
                 let token = self.advance().clone();
@@ -715,6 +717,18 @@ impl Parser {
             vec![Statement::Return(self.parse_expression()?)]
         };
         Ok(Expr::Lambda { params, body })
+    }
+
+    /// 解析 `|| { ... }` 空參數 lambda（`||` 被 lexer 合併為 Token::Or）
+    fn parse_empty_lambda(&mut self) -> Result<Expr> {
+        // 消費 Token::Or（即 `||`）
+        self.advance();
+        let body = if self.check(&Token::LBrace) {
+            self.parse_block()?
+        } else {
+            vec![Statement::Return(self.parse_expression()?)]
+        };
+        Ok(Expr::Lambda { params: vec![], body })
     }
 
     fn consume_ident(&mut self) -> Result<String> {

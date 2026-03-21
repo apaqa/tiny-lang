@@ -3,7 +3,8 @@
     "allow": [
       "Bash(cargo build:*)",
       "Bash(cargo test:*)",
-      "Bash(grep -v \"fn \\\\|let \\\\|pub \\\\|impl \\\\|use \\\\|//\")"
+      "Bash(grep -v \"fn \\\\|let \\\\|pub \\\\|impl \\\\|use \\\\|//\")",
+      "Bash(grep -c \"ok$\")"
     ]
   }
 }

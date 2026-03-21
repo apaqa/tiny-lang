@@ -1,7 +1,9 @@
 //! Bytecode VM。
 //!
 //! VM 會執行 compiler 產生的 Chunk，並維護 stack 與 call frame。
+//! Phase 7 新增：閉包 upvalue 支援、enum 指令、自動 GC 觸發。
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Stdout, Write};
 use std::rc::Rc;
@@ -9,8 +11,8 @@ use std::rc::Rc;
 use crate::ast::TypeAnnotation;
 use crate::compiler::{Chunk, OpCode};
 use crate::environment::{
-    array_value, map_value, render_value, string_value, struct_instance_value, CompiledFunction,
-    NativeFunction, StructDef, Value, VmBoundMethodValue,
+    array_value, closure_value, enum_variant_value, map_value, render_value, string_value,
+    struct_instance_value, CompiledFunction, NativeFunction, StructDef, Value, VmBoundMethodValue,
 };
 use crate::error::{Result, TinyLangError};
 use crate::gc::GcHeap;
@@ -21,6 +23,8 @@ pub struct CallFrame {
     pub function: Rc<CompiledFunction>,
     pub ip: usize,
     pub slot_offset: usize,
+    /// 閉包的 upvalue 列表（普通函式為空）
+    pub upvalues: Vec<Rc<RefCell<Value>>>,
 }
 
 /// Bytecode 虛擬機。
@@ -81,6 +85,7 @@ impl<W: Write> VM<W> {
             function: script,
             ip: 0,
             slot_offset: 0,
+            upvalues: Vec::new(), // 腳本頂層沒有 upvalue
         });
 
         loop {
@@ -134,6 +139,55 @@ impl<W: Write> VM<W> {
                 OpCode::SetGlobal(name) => {
                     let value = self.pop_value()?;
                     self.globals.insert(name, value);
+                }
+                OpCode::GetUpvalue(index) => {
+                    // 從當前 frame 的 upvalue cell 讀取值
+                    let value = self
+                        .frames
+                        .last()
+                        .expect("active frame")
+                        .upvalues
+                        .get(index)
+                        .ok_or_else(|| TinyLangError::runtime(format!("Upvalue index {index} out of bounds")))?
+                        .borrow()
+                        .clone();
+                    self.stack.push(value);
+                }
+                OpCode::SetUpvalue(index) => {
+                    // 寫入當前 frame 的 upvalue cell
+                    let value = self.pop_value()?;
+                    let cell = self
+                        .frames
+                        .last()
+                        .expect("active frame")
+                        .upvalues
+                        .get(index)
+                        .ok_or_else(|| TinyLangError::runtime(format!("Upvalue index {index} out of bounds")))?
+                        .clone(); // clone Rc（cheap），避免 borrow 衝突
+                    *cell.borrow_mut() = value;
+                }
+                OpCode::CloseUpvalue => {
+                    // 在此實作中，upvalue 在建立閉包時已複製到 Rc<RefCell<>>
+                    // CloseUpvalue 只需彈出 stack 頂部值（與 Pop 相同）
+                    self.pop_value()?;
+                }
+                OpCode::MakeClosure(const_idx) => {
+                    // 從常數池取得函式原型
+                    let function = match &self.current_chunk().constants[const_idx] {
+                        Value::CompiledFunction(f) => f.clone(),
+                        _ => return Err(TinyLangError::runtime("MakeClosure: expected CompiledFunction constant")),
+                    };
+                    let capture_count = function.capture_names.len();
+                    // 從 stack 取出捕獲值（後進先出，需反轉恢復原始順序）
+                    let mut captured: Vec<Rc<RefCell<Value>>> = (0..capture_count)
+                        .map(|_| self.pop_value().map(|v| Rc::new(RefCell::new(v))))
+                        .collect::<Result<_>>()?;
+                    captured.reverse();
+                    // 建立 closure 物件並推入 stack
+                    let closure = closure_value(&mut self.heap, function, captured);
+                    self.stack.push(closure);
+                    // 分配後檢查是否需要觸發 GC
+                    self.try_collect_garbage();
                 }
                 OpCode::Add => self.execute_add()?,
                 OpCode::Sub => self.execute_int_binary("subtract", |a, b| a - b)?,
@@ -227,6 +281,8 @@ impl<W: Write> VM<W> {
                     items.reverse();
                     let arr = array_value(&mut self.heap, items);
                     self.stack.push(arr);
+                    // 陣列分配後檢查是否需要觸發 GC
+                    self.try_collect_garbage();
                 }
                 OpCode::MakeMap(count) => {
                     let mut entries = Vec::with_capacity(count);
@@ -242,6 +298,8 @@ impl<W: Write> VM<W> {
                     }
                     let map_val = map_value(&mut self.heap, map);
                     self.stack.push(map_val);
+                    // Map 分配後檢查是否需要觸發 GC
+                    self.try_collect_garbage();
                 }
                 OpCode::Index => {
                     let index = self.pop_value()?;
@@ -296,6 +354,52 @@ impl<W: Write> VM<W> {
 
                     let instance = struct_instance_value(&mut self.heap, type_name, fields);
                     self.stack.push(instance);
+                }
+                OpCode::MakeEnumVariant(enum_name, variant_name, field_names) => {
+                    // 從 stack 彈出欄位值（後進先出，需反轉）
+                    let mut values: Vec<Value> = (0..field_names.len())
+                        .map(|_| self.pop_value())
+                        .collect::<Result<_>>()?;
+                    values.reverse();
+                    // 建立欄位 HashMap
+                    let mut fields = HashMap::new();
+                    for (name, value) in field_names.iter().zip(values.into_iter()) {
+                        fields.insert(name.clone(), value);
+                    }
+                    // 建立 enum variant 值並推入 stack
+                    let variant = enum_variant_value(&mut self.heap, enum_name, variant_name, fields);
+                    self.stack.push(variant);
+                }
+                OpCode::CheckEnumVariant(enum_name, variant_name) => {
+                    // 彈出頂部值，檢查是否為指定的 enum variant，推入 bool
+                    let value = self.pop_value()?;
+                    let matches = match &value {
+                        Value::EnumVariant(reference) => {
+                            self.heap.with_enum_variant(reference, |ev| {
+                                ev.enum_name == enum_name && ev.variant_name == variant_name
+                            })
+                        }
+                        _ => false,
+                    };
+                    self.stack.push(Value::Bool(matches));
+                }
+                OpCode::GetEnumField(field_name) => {
+                    // 彈出 enum variant，推入指定欄位的值
+                    let value = self.pop_value()?;
+                    match value {
+                        Value::EnumVariant(reference) => {
+                            let field_value = self.heap.with_enum_variant(&reference, |ev| {
+                                ev.fields.get(&field_name).cloned().unwrap_or(Value::Null)
+                            });
+                            self.stack.push(field_value);
+                        }
+                        other => {
+                            return Err(TinyLangError::runtime(format!(
+                                "GetEnumField expects EnumVariant, got {}",
+                                other.type_name_for_error()
+                            )))
+                        }
+                    }
                 }
                 OpCode::RuntimeError(message) => return Err(TinyLangError::runtime(message)),
                 OpCode::Halt => return Ok(self.stack.last().cloned().unwrap_or(Value::Null)),
@@ -395,6 +499,16 @@ impl<W: Write> VM<W> {
                 }
                 self.prepare_function_call(function, callee_index + 1, arg_count)?;
             }
+            Value::Closure(closure_ref) => {
+                // 呼叫閉包：取得函式和 upvalue，建立帶 upvalue 的 frame
+                let closure = self.heap.get_closure(&closure_ref);
+                if closure.function.takes_self {
+                    return Err(TinyLangError::runtime("closure method requires receiver"));
+                }
+                let upvalues = closure.upvalues.clone();
+                let function = closure.function.clone();
+                self.prepare_closure_call(function, upvalues, callee_index + 1, arg_count)?;
+            }
             Value::NativeFunction(native) => {
                 self.call_native(native, callee_index, arg_count)?;
             }
@@ -443,6 +557,45 @@ impl<W: Write> VM<W> {
             function,
             ip: 0,
             slot_offset,
+            upvalues: Vec::new(), // 普通函式沒有 upvalue
+        });
+        Ok(())
+    }
+
+    /// 建立帶 upvalue 的閉包呼叫 frame。
+    fn prepare_closure_call(
+        &mut self,
+        function: Rc<CompiledFunction>,
+        upvalues: Vec<Rc<RefCell<Value>>>,
+        slot_offset: usize,
+        arg_count: usize,
+    ) -> Result<()> {
+        if function.arity() != arg_count {
+            let name = function.name.as_deref().unwrap_or("<closure>");
+            return Err(TinyLangError::runtime(format!(
+                "Closure '{name}' expects {} arguments, got {}",
+                function.arity(),
+                arg_count
+            )));
+        }
+
+        // 型別檢查參數
+        for (index, (_, annotation)) in function.params.iter().enumerate() {
+            if let Some(annotation) = annotation {
+                let value = self
+                    .stack
+                    .get(slot_offset + index)
+                    .cloned()
+                    .ok_or_else(|| TinyLangError::runtime("VM argument slot missing"))?;
+                self.ensure_type_matches(annotation, &value)?;
+            }
+        }
+
+        self.frames.push(CallFrame {
+            function,
+            ip: 0,
+            slot_offset,
+            upvalues, // 傳入閉包的 upvalue 列表
         });
         Ok(())
     }
@@ -768,6 +921,31 @@ impl<W: Write> VM<W> {
                 other.type_name_for_error()
             ))),
         }
+    }
+
+    /// 當 heap 超過閾值時，自動觸發 mark-and-sweep GC。
+    ///
+    /// 收集 stack、globals 和所有 frame upvalue 作為根。
+    fn try_collect_garbage(&mut self) {
+        if !self.heap.should_collect() {
+            return;
+        }
+        // 收集所有可達的根值
+        let mut roots: Vec<Value> = self.stack.clone();
+        roots.extend(self.globals.values().cloned());
+        // 包含所有 frame 的 upvalue cell 中的值
+        for frame in &self.frames {
+            for cell in &frame.upvalues {
+                roots.push(cell.borrow().clone());
+            }
+        }
+        // 收集所有 frame 的常數池（字串常數在 heap 上）
+        let constant_roots: Vec<Value> = self
+            .frames
+            .iter()
+            .flat_map(|f| f.function.chunk.constants.iter().cloned())
+            .collect();
+        self.heap.mark_and_sweep(&roots, &constant_roots);
     }
 
     fn install_natives(&mut self) {

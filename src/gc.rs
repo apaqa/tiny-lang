@@ -164,14 +164,25 @@ impl GcHeap {
     }
 
     fn alloc_object<T>(&mut self, object: HeapObject) -> GcRef<T> {
+        // 先嘗試重用已被 GC 釋放（object == None）的 slot，避免陣列無限增長
         let index = {
             let mut storage = self.storage.borrow_mut();
-            let index = storage.objects.len();
-            storage.objects.push(HeapEntry {
-                marked: false,
-                object: Some(object),
-            });
-            index
+            if let Some(free_index) = storage.objects.iter().position(|e| e.object.is_none()) {
+                // 重用已釋放的 slot
+                storage.objects[free_index] = HeapEntry {
+                    marked: false,
+                    object: Some(object),
+                };
+                free_index
+            } else {
+                // 沒有空閒 slot，在陣列末尾追加新物件
+                let index = storage.objects.len();
+                storage.objects.push(HeapEntry {
+                    marked: false,
+                    object: Some(object),
+                });
+                index
+            }
         };
         self.total_allocations += 1;
         GcRef {

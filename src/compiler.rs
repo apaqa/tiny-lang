@@ -2,11 +2,15 @@
 //!
 //! 這一版會把 AST 編譯成 Chunk，交給 VM 執行。
 //! 編譯器採用 stack machine 模型，區域變數以 slot index 管理。
+//! Phase 7 新增：閉包 upvalue 分析與編譯、enum 支援。
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::rc::Rc;
 
-use crate::ast::{BinaryOperator, Expr, MatchArm, Pattern, Program, Statement, TypeAnnotation, UnaryOperator};
+use crate::ast::{
+    BinaryOperator, Expr, MatchArm, Pattern, Program, Statement, TypeAnnotation, UnaryOperator,
+};
 use crate::environment::{CompiledFunction, StructDef, Value};
 use crate::error::{Result, TinyLangError};
 use crate::gc::GcHeap;
@@ -20,6 +24,14 @@ pub enum OpCode {
     SetLocal(usize),
     GetGlobal(String),
     SetGlobal(String),
+    /// 讀取當前 frame 的第 i 個 upvalue（閉包捕獲的外部變數）
+    GetUpvalue(usize),
+    /// 寫入當前 frame 的第 i 個 upvalue
+    SetUpvalue(usize),
+    /// 關閉 upvalue（被捕獲的 local 離開作用域時發出）
+    CloseUpvalue,
+    /// 從常數池建立閉包，並從 stack 上取得 capture_names.len() 個捕獲值
+    MakeClosure(usize),
     Add,
     Sub,
     Mul,
@@ -46,6 +58,12 @@ pub enum OpCode {
     GetField(String),
     SetField(String),
     MakeStruct(String, usize),
+    /// 建立 enum variant 值，field_names 依序對應 stack 上的值
+    MakeEnumVariant(String, String, Vec<String>),
+    /// 彈出頂部值，檢查是否為指定 enum variant，推入 bool
+    CheckEnumVariant(String, String),
+    /// 彈出 enum variant，推入指定欄位的值
+    GetEnumField(String),
     RuntimeError(String),
     Halt,
 }
@@ -85,10 +103,13 @@ impl PartialEq for Chunk {
 
 impl Eq for Chunk {}
 
+/// 區域變數資訊。
 #[derive(Debug, Clone)]
 struct Local {
     name: String,
     depth: usize,
+    /// 是否被內部閉包捕獲
+    captured: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +127,8 @@ pub struct Compiler {
     scope_depth: usize,
     loop_stack: Vec<LoopContext>,
     max_local_count: usize,
+    /// 當前函式所捕獲的 upvalue 名稱列表（只在閉包 compiler 中有值）
+    upvalue_names: Vec<String>,
 }
 
 impl Default for Compiler {
@@ -116,6 +139,7 @@ impl Default for Compiler {
             scope_depth: 0,
             loop_stack: Vec::new(),
             max_local_count: 0,
+            upvalue_names: Vec::new(),
         }
     }
 }
@@ -151,6 +175,41 @@ impl Compiler {
             scope_depth: 1,
             loop_stack: Vec::new(),
             max_local_count: 0,
+            upvalue_names: Vec::new(),
+        };
+
+        if takes_self {
+            compiler.add_local("self".into());
+        }
+        for (name, _) in params {
+            compiler.add_local(name);
+        }
+        compiler
+    }
+
+    /// 建立一個帶有 upvalue 的閉包 compiler（用於 lambda 編譯）。
+    fn new_closure(
+        params: Vec<(String, Option<TypeAnnotation>)>,
+        takes_self: bool,
+        inherited_structs: HashMap<String, StructDef>,
+        inherited_methods: HashMap<String, HashMap<String, Rc<CompiledFunction>>>,
+        capture_names: Vec<String>,
+    ) -> Self {
+        let mut compiler = Self {
+            chunk: Chunk {
+                code: Vec::new(),
+                constants: Vec::new(),
+                lines: Vec::new(),
+                structs: inherited_structs,
+                methods: inherited_methods,
+                heap: GcHeap::new(),
+            },
+            locals: Vec::new(),
+            scope_depth: 1,
+            loop_stack: Vec::new(),
+            max_local_count: 0,
+            // 設定 upvalue 名稱，讓 Ident 解析能識別捕獲變數
+            upvalue_names: capture_names,
         };
 
         if takes_self {
@@ -167,9 +226,11 @@ impl Compiler {
             Statement::Import { .. } => Err(TinyLangError::runtime(
                 "bytecode VM does not support import yet; use tree-walking interpreter",
             )),
-            Statement::EnumDecl { .. } => Err(TinyLangError::runtime(
-                "bytecode VM does not support enum yet; use tree-walking interpreter",
-            )),
+            Statement::EnumDecl { .. } => {
+                // VM 模式下 enum 定義不需要生成 bytecode
+                // enum variant 的建立由 MakeEnumVariant 指令處理
+                Ok(())
+            }
             Statement::StructDecl { name, fields } => {
                 self.chunk.structs.insert(
                     name.clone(),
@@ -216,8 +277,12 @@ impl Compiler {
             }
             Statement::Assignment { name, value } => {
                 self.compile_expr(value)?;
+                // 先檢查是否是 local 變數
                 if let Some(slot) = self.resolve_local(name) {
                     self.emit(OpCode::SetLocal(slot));
+                } else if let Some(idx) = self.resolve_upvalue(name) {
+                    // 再檢查是否是捕獲的 upvalue（閉包內修改外部變數）
+                    self.emit(OpCode::SetUpvalue(idx));
                 } else {
                     self.emit(OpCode::SetGlobal(name.clone()));
                 }
@@ -305,8 +370,13 @@ impl Compiler {
             }
             Expr::Ident(name) => {
                 if let Some(slot) = self.resolve_local(name) {
+                    // 先查 local 變數
                     self.emit(OpCode::GetLocal(slot));
+                } else if let Some(idx) = self.resolve_upvalue(name) {
+                    // 再查 upvalue（閉包捕獲的外部變數）
+                    self.emit(OpCode::GetUpvalue(idx));
                 } else {
+                    // 最後查 global
                     self.emit(OpCode::GetGlobal(name.clone()));
                 }
             }
@@ -369,18 +439,126 @@ impl Compiler {
                 }
                 self.emit(OpCode::Call(args.len()));
             }
-            Expr::Lambda { .. } => {
-                return Err(TinyLangError::runtime(
-                    "bytecode VM does not support lambda/closure yet; use tree-walking interpreter",
-                ));
+            Expr::Lambda { params, body } => {
+                // 編譯 lambda：分析捕獲的外部變數，生成 MakeClosure 指令
+                self.compile_lambda(params, body)?;
             }
-            Expr::EnumVariant { .. } => {
-                return Err(TinyLangError::runtime(
-                    "bytecode VM does not support enum yet; use tree-walking interpreter",
-                ));
+            Expr::EnumVariant { enum_name, variant, fields } => {
+                // 編譯 enum variant 建立：推送所有欄位值，發出 MakeEnumVariant
+                let mut field_names = Vec::new();
+                if let Some(fields) = fields {
+                    for (field_name, expr) in fields {
+                        self.compile_expr(expr)?;
+                        field_names.push(field_name.clone());
+                    }
+                }
+                self.emit(OpCode::MakeEnumVariant(enum_name.clone(), variant.clone(), field_names));
             }
         }
         Ok(())
+    }
+
+    /// 編譯 lambda 表達式，分析捕獲的外部 local 變數，生成 upvalue。
+    fn compile_lambda(&mut self, params: &[String], body: &[Statement]) -> Result<()> {
+        // 收集 lambda 體中所有引用的識別符
+        let all_refs = collect_body_idents(body);
+
+        // 排除 lambda 自身的參數（它們是 bound 的）
+        let param_set: HashSet<&str> = params.iter().map(|p| p.as_str()).collect();
+
+        // 找出在外部作用域 locals 中定義的識別符 → 這些是需要捕獲的 upvalue
+        let mut captures: Vec<(usize, String)> = all_refs
+            .iter()
+            .filter(|name| !param_set.contains(name.as_str()))
+            .filter_map(|name| self.resolve_local(name).map(|slot| (slot, name.clone())))
+            .collect();
+
+        // 按 slot 排序確保一致的順序
+        captures.sort_by_key(|(slot, _)| *slot);
+        captures.dedup_by_key(|(slot, _)| *slot);
+
+        let capture_names: Vec<String> = captures.iter().map(|(_, name)| name.clone()).collect();
+
+        // 標記被捕獲的 locals，讓 end_scope 生成 CloseUpvalue 而非 Pop
+        for (slot, _) in &captures {
+            if let Some(local) = self.locals.get_mut(*slot) {
+                local.captured = true;
+            }
+        }
+
+        // 建立 lambda 的參數列表（lambda 沒有型別註記）
+        let param_pairs: Vec<(String, Option<TypeAnnotation>)> =
+            params.iter().map(|p| (p.clone(), None)).collect();
+
+        // 編譯閉包函式（使用帶 upvalue_names 的內部 compiler）
+        let function = self.compile_closure_function(
+            None,
+            param_pairs,
+            None,
+            body,
+            false,
+            capture_names.clone(),
+        )?;
+
+        let const_idx = self.push_constant(Value::CompiledFunction(function));
+
+        if captures.is_empty() {
+            // 無捕獲變數：直接作為普通函式常數使用（不需要 Closure 包裝）
+            self.emit(OpCode::Constant(const_idx));
+        } else {
+            // 有捕獲變數：先推入各捕獲值，再發出 MakeClosure
+            // VM 的 MakeClosure 會從 stack 取出這些值建立 Closure 物件
+            for (slot, _) in &captures {
+                self.emit(OpCode::GetLocal(*slot));
+            }
+            self.emit(OpCode::MakeClosure(const_idx));
+        }
+
+        Ok(())
+    }
+
+    /// 編譯帶有 upvalue 支援的閉包函式。
+    fn compile_closure_function(
+        &mut self,
+        name: Option<String>,
+        params: Vec<(String, Option<TypeAnnotation>)>,
+        return_type: Option<TypeAnnotation>,
+        body: &[Statement],
+        takes_self: bool,
+        capture_names: Vec<String>,
+    ) -> Result<Rc<CompiledFunction>> {
+        let mut compiler = Compiler::new_closure(
+            params.clone(),
+            takes_self,
+            self.chunk.structs.clone(),
+            self.chunk.methods.clone(),
+            capture_names.clone(),
+        );
+
+        // 與父 compiler 共享 heap，讓字串常數存在同一個 GcHeap
+        std::mem::swap(&mut self.chunk.heap, &mut compiler.chunk.heap);
+
+        for statement in body {
+            compiler.compile_statement(statement)?;
+        }
+
+        // 確保函式有 return（不管有沒有 return 語句）
+        let null_constant = compiler.push_constant(Value::Null);
+        compiler.emit(OpCode::Constant(null_constant));
+        compiler.emit(OpCode::Return);
+
+        // 歸還 heap 給父 compiler
+        std::mem::swap(&mut self.chunk.heap, &mut compiler.chunk.heap);
+
+        Ok(Rc::new(CompiledFunction {
+            name,
+            params,
+            return_type,
+            chunk: Rc::new(compiler.chunk),
+            local_count: compiler.max_local_count,
+            takes_self,
+            capture_names,
+        }))
     }
 
     fn compile_if_else(
@@ -598,10 +776,28 @@ impl Compiler {
                     self.end_scope();
                     end_jumps.push(self.emit_jump(OpCode::Jump(usize::MAX)));
                 }
-                Pattern::EnumVariant { .. } => {
-                    return Err(TinyLangError::runtime(
-                        "bytecode VM does not support enum pattern matching yet; use tree-walking interpreter",
-                    ));
+                Pattern::EnumVariant { enum_name, variant, bindings } => {
+                    // 推入 match 值的副本，用於 variant 名稱比對
+                    self.emit(OpCode::GetLocal(match_slot));
+                    // CheckEnumVariant 彈出值，推入 bool
+                    self.emit(OpCode::CheckEnumVariant(enum_name.clone(), variant.clone()));
+                    let next_arm = self.emit_jump(OpCode::JumpIfFalse(usize::MAX));
+                    self.emit(OpCode::Pop); // 彈出 true bool
+                    self.begin_scope();
+                    // 如果有綁定名稱，把整個 variant 值綁定到第一個名稱
+                    if let Some(binding_names) = bindings {
+                        if !binding_names.is_empty() {
+                            self.emit(OpCode::GetLocal(match_slot));
+                            self.add_local(binding_names[0].clone());
+                        }
+                    }
+                    for statement in &arm.body {
+                        self.compile_statement(statement)?;
+                    }
+                    self.end_scope();
+                    end_jumps.push(self.emit_jump(OpCode::Jump(usize::MAX)));
+                    self.patch_jump(next_arm, self.chunk.code.len());
+                    self.emit(OpCode::Pop); // 彈出 false bool
                 }
             }
         }
@@ -724,9 +920,16 @@ impl Compiler {
     }
 
     fn end_scope(&mut self) {
+        // 彈出當前作用域的所有 local 變數
+        // 被捕獲的變數發出 CloseUpvalue，其他發出 Pop
         while matches!(self.locals.last(), Some(local) if local.depth == self.scope_depth) {
-            self.emit(OpCode::Pop);
-            self.locals.pop();
+            let local = self.locals.pop().unwrap();
+            if local.captured {
+                // 被閉包捕獲的變數，發出 CloseUpvalue 指令
+                self.emit(OpCode::CloseUpvalue);
+            } else {
+                self.emit(OpCode::Pop);
+            }
         }
         self.scope_depth = self.scope_depth.saturating_sub(1);
     }
@@ -736,6 +939,7 @@ impl Compiler {
         self.locals.push(Local {
             name,
             depth: self.scope_depth,
+            captured: false,
         });
         self.max_local_count = self.max_local_count.max(self.locals.len());
         slot
@@ -747,6 +951,11 @@ impl Compiler {
 
     fn resolve_local(&self, name: &str) -> Option<usize> {
         self.locals.iter().rposition(|local| local.name == name)
+    }
+
+    /// 解析 upvalue 索引（只在閉包 compiler 中有效）。
+    fn resolve_upvalue(&self, name: &str) -> Option<usize> {
+        self.upvalue_names.iter().position(|n| n == name)
     }
 
     fn emit(&mut self, opcode: OpCode) {
@@ -799,6 +1008,129 @@ impl Compiler {
     fn push_constant(&mut self, value: Value) -> usize {
         self.chunk.constants.push(value);
         self.chunk.constants.len() - 1
+    }
+}
+
+/// 收集語句列表中所有引用的識別符名稱（用於 upvalue 分析）。
+fn collect_body_idents(stmts: &[Statement]) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for stmt in stmts {
+        collect_stmt_idents(stmt, &mut set);
+    }
+    set
+}
+
+fn collect_stmt_idents(stmt: &Statement, set: &mut HashSet<String>) {
+    match stmt {
+        Statement::LetDecl { value, .. } => collect_expr_idents(value, set),
+        Statement::Assignment { name, value } => {
+            // 指定的目標變數名也需要記錄（可能是需要透過 SetUpvalue 修改的捕獲變數）
+            set.insert(name.clone());
+            collect_expr_idents(value, set);
+        }
+        Statement::IndexAssignment { target, index, value } => {
+            collect_expr_idents(target, set);
+            collect_expr_idents(index, set);
+            collect_expr_idents(value, set);
+        }
+        Statement::FieldAssignment { object, value, .. } => {
+            collect_expr_idents(object, set);
+            collect_expr_idents(value, set);
+        }
+        Statement::Return(expr) | Statement::Print(expr) | Statement::ExprStatement(expr) => {
+            collect_expr_idents(expr, set);
+        }
+        Statement::IfElse { condition, then_body, else_body } => {
+            collect_expr_idents(condition, set);
+            for s in then_body {
+                collect_stmt_idents(s, set);
+            }
+            if let Some(eb) = else_body {
+                for s in eb {
+                    collect_stmt_idents(s, set);
+                }
+            }
+        }
+        Statement::While { condition, body } => {
+            collect_expr_idents(condition, set);
+            for s in body {
+                collect_stmt_idents(s, set);
+            }
+        }
+        Statement::ForLoop { iterable, body, .. } => {
+            collect_expr_idents(iterable, set);
+            for s in body {
+                collect_stmt_idents(s, set);
+            }
+        }
+        Statement::Match { expr, arms } => {
+            collect_expr_idents(expr, set);
+            for arm in arms {
+                for s in &arm.body {
+                    collect_stmt_idents(s, set);
+                }
+            }
+        }
+        Statement::FnDecl { body, .. } => {
+            for s in body {
+                collect_stmt_idents(s, set);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_expr_idents(expr: &Expr, set: &mut HashSet<String>) {
+    match expr {
+        Expr::Ident(name) => {
+            set.insert(name.clone());
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_idents(left, set);
+            collect_expr_idents(right, set);
+        }
+        Expr::UnaryOp { operand, .. } => collect_expr_idents(operand, set),
+        Expr::FnCall { callee, args } => {
+            collect_expr_idents(callee, set);
+            for a in args {
+                collect_expr_idents(a, set);
+            }
+        }
+        Expr::IndexAccess { target, index } => {
+            collect_expr_idents(target, set);
+            collect_expr_idents(index, set);
+        }
+        Expr::FieldAccess { object, .. } => collect_expr_idents(object, set),
+        Expr::ArrayLit(items) => {
+            for i in items {
+                collect_expr_idents(i, set);
+            }
+        }
+        Expr::MapLit(items) => {
+            for (k, v) in items {
+                collect_expr_idents(k, set);
+                collect_expr_idents(v, set);
+            }
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, e) in fields {
+                collect_expr_idents(e, set);
+            }
+        }
+        Expr::EnumVariant { fields, .. } => {
+            if let Some(fields) = fields {
+                for (_, e) in fields {
+                    collect_expr_idents(e, set);
+                }
+            }
+        }
+        Expr::Lambda { body, .. } => {
+            // 巢狀 lambda 中的引用也算外層的自由變數候選
+            for s in body {
+                collect_stmt_idents(s, set);
+            }
+        }
+        _ => {}
     }
 }
 
