@@ -1,7 +1,7 @@
 //! tiny-lang formatter。
 
 use crate::ast::{
-    BinaryOperator, EnumVariant, Expr, MatchArm, Pattern, Program, Statement, TypeAnnotation,
+    BinaryOperator, EnumVariant, Expr, InterfaceMethod, Pattern, Program, Statement, TypeAnnotation,
     UnaryOperator,
 };
 
@@ -27,7 +27,10 @@ impl Formatter {
 
     fn format_program(mut self, program: &Program) -> String {
         for (index, statement) in program.iter().enumerate() {
-            let is_fn_like = matches!(statement, Statement::FnDecl { .. } | Statement::MethodDecl { .. });
+            let is_fn_like = matches!(
+                statement,
+                Statement::FnDecl { .. } | Statement::MethodDecl { .. } | Statement::ImplInterface { .. }
+            );
             if index > 0 {
                 self.output.push('\n');
                 if is_fn_like || self.previous_was_fn_like {
@@ -71,6 +74,40 @@ impl Formatter {
                     self.write_indent();
                     self.output.push('}');
                 }
+            }
+            Statement::InterfaceDecl { name, methods } => {
+                self.output.push_str(&format!("interface {name} {{"));
+                if methods.is_empty() {
+                    self.output.push_str(" }");
+                } else {
+                    self.output.push('\n');
+                    self.indent_level += 1;
+                    for method in methods {
+                        self.write_indent();
+                        self.write_interface_method(method);
+                        self.output.push('\n');
+                    }
+                    self.indent_level -= 1;
+                    self.write_indent();
+                    self.output.push('}');
+                }
+            }
+            Statement::ImplInterface {
+                interface_name,
+                struct_name,
+                methods,
+            } => {
+                self.output
+                    .push_str(&format!("impl {interface_name} for {struct_name} "));
+                self.output.push_str("{\n");
+                self.indent_level += 1;
+                for method in methods {
+                    self.write_statement(method);
+                    self.output.push('\n');
+                }
+                self.indent_level -= 1;
+                self.write_indent();
+                self.output.push('}');
             }
             Statement::EnumDecl { name, variants } => {
                 self.output.push_str(&format!("enum {name} {{"));
@@ -258,6 +295,13 @@ impl Formatter {
         }
     }
 
+    fn write_interface_method(&mut self, method: &InterfaceMethod) {
+        self.output.push_str("fn ");
+        self.output.push_str(&method.name);
+        self.write_function_signature(&method.params, &method.return_type);
+        self.output.push(';');
+    }
+
     fn write_block(&mut self, body: &[Statement]) {
         self.output.push_str("{\n");
         self.indent_level += 1;
@@ -293,6 +337,7 @@ impl Formatter {
             Expr::IntLit(value) => value.to_string(),
             Expr::StringLit(value) => self.format_string_literal(value),
             Expr::BoolLit(value) => value.to_string(),
+            Expr::NullLit => "null".into(),
             Expr::Ident(name) => name.clone(),
             Expr::StructInit { name, fields } => {
                 let items = fields

@@ -36,6 +36,14 @@ pub struct EnumVariant {
     pub fields: Option<Vec<(String, Option<TypeAnnotation>)>>,
 }
 
+/// interface method AST
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceMethod {
+    pub name: String,
+    pub params: Vec<(String, Option<TypeAnnotation>)>,
+    pub return_type: Option<TypeAnnotation>,
+}
+
 /// 陳述式。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -43,6 +51,15 @@ pub enum Statement {
     StructDecl {
         name: String,
         fields: Vec<(String, Option<TypeAnnotation>)>,
+    },
+    InterfaceDecl {
+        name: String,
+        methods: Vec<InterfaceMethod>,
+    },
+    ImplInterface {
+        interface_name: String,
+        struct_name: String,
+        methods: Vec<Statement>,
     },
     EnumDecl {
         name: String,
@@ -116,6 +133,7 @@ pub enum Expr {
     IntLit(i64),
     StringLit(String),
     BoolLit(bool),
+    NullLit,
     Ident(String),
     StructInit {
         name: String,

@@ -1,10 +1,10 @@
 //! 執行期值與環境定義。
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::ast::{Statement, TypeAnnotation};
+use crate::ast::{InterfaceMethod, Statement, TypeAnnotation};
 use crate::compiler::Chunk;
 use crate::error::{Result, TinyLangError};
 use crate::gc::{
@@ -54,6 +54,13 @@ pub struct FunctionValue {
 pub struct StructDef {
     pub name: String,
     pub fields: Vec<(String, Option<TypeAnnotation>)>,
+}
+
+/// interface 定義
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceDef {
+    pub name: String,
+    pub methods: Vec<InterfaceMethod>,
 }
 
 /// 與舊程式碼相容的 struct instance 快照。
@@ -170,8 +177,10 @@ pub type EnvRef = Rc<RefCell<Environment>>;
 pub struct Environment {
     values: HashMap<String, Binding>,
     structs: HashMap<String, StructDef>,
+    interfaces: HashMap<String, InterfaceDef>,
     enums: HashMap<String, EnumDef>,
     methods: HashMap<String, HashMap<String, FunctionValue>>,
+    impls: HashMap<String, HashSet<String>>,
     parent: Option<EnvRef>,
 }
 
@@ -180,8 +189,10 @@ impl Environment {
         Rc::new(RefCell::new(Self {
             values: HashMap::new(),
             structs: HashMap::new(),
+            interfaces: HashMap::new(),
             enums: HashMap::new(),
             methods: HashMap::new(),
+            impls: HashMap::new(),
             parent: None,
         }))
     }
@@ -190,8 +201,10 @@ impl Environment {
         Rc::new(RefCell::new(Self {
             values: HashMap::new(),
             structs: HashMap::new(),
+            interfaces: HashMap::new(),
             enums: HashMap::new(),
             methods: HashMap::new(),
+            impls: HashMap::new(),
             parent: Some(parent),
         }))
     }
@@ -255,6 +268,28 @@ impl Environment {
         Err(TinyLangError::runtime(format!("Struct '{name}' not defined")))
     }
 
+    pub fn define_interface(&mut self, name: String, def: InterfaceDef) {
+        self.interfaces.insert(name, def);
+    }
+
+    pub fn get_interface(&self, name: &str) -> Result<InterfaceDef> {
+        if let Some(def) = self.interfaces.get(name) {
+            return Ok(def.clone());
+        }
+        if let Some(parent) = &self.parent {
+            return parent.borrow().get_interface(name);
+        }
+        Err(TinyLangError::runtime(format!("Interface '{name}' not defined")))
+    }
+
+    pub fn has_interface(&self, name: &str) -> bool {
+        self.interfaces.contains_key(name)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.borrow().has_interface(name))
+    }
+
     pub fn define_enum(&mut self, name: String, def: EnumDef) {
         self.enums.insert(name, def);
     }
@@ -286,6 +321,39 @@ impl Environment {
             "Method '{}.{}' not defined",
             struct_name, method_name
         )))
+    }
+
+    pub fn has_method(&self, struct_name: &str, method_name: &str) -> bool {
+        self.methods
+            .get(struct_name)
+            .is_some_and(|methods| methods.contains_key(method_name))
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.borrow().has_method(struct_name, method_name))
+    }
+
+    pub fn define_interface_impl(&mut self, struct_name: String, interface_name: String) {
+        self.impls.entry(struct_name).or_default().insert(interface_name);
+    }
+
+    pub fn struct_declares_interface(&self, struct_name: &str, interface_name: &str) -> bool {
+        self.impls
+            .get(struct_name)
+            .is_some_and(|interfaces| interfaces.contains(interface_name))
+            || self.parent.as_ref().is_some_and(|parent| {
+                parent
+                    .borrow()
+                    .struct_declares_interface(struct_name, interface_name)
+            })
+    }
+
+    pub fn struct_implements_interface(&self, struct_name: &str, interface_name: &str) -> bool {
+        // 內建 Iterator 介面採結構型檢查：只要有 next 方法即可。
+        if interface_name == "Iterator" {
+            return self.has_method(struct_name, "next");
+        }
+        self.struct_declares_interface(struct_name, interface_name)
     }
 }
 

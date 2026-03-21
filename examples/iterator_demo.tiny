@@ -1,0 +1,15 @@
+// 透過 next() 方法實作 Iterator protocol。
+struct Range { current: int, end: int }
+
+fn Range.next(self) -> int {
+    if self.current >= self.end {
+        return null;
+    }
+    let val = self.current;
+    self.current = self.current + 1;
+    return val;
+}
+
+for i in Range { current: 0, end: 5 } {
+    print(i);
+}

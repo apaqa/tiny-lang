@@ -7,10 +7,12 @@ use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Stdin, Stdout, Write};
 use std::path::{Path, PathBuf};
 
-use crate::ast::{BinaryOperator, Expr, Pattern, Program, Statement, TypeAnnotation, UnaryOperator};
+use crate::ast::{
+    BinaryOperator, Expr, InterfaceMethod, Pattern, Program, Statement, TypeAnnotation, UnaryOperator,
+};
 use crate::environment::{
     array_value, enum_variant_value, map_value, render_value, string_value, struct_instance_value,
-    BuiltinFunction, EnumDef, EnvRef, Environment, FunctionValue, StructDef, Value,
+    BuiltinFunction, EnumDef, EnvRef, Environment, FunctionValue, InterfaceDef, StructDef, Value,
 };
 use crate::error::{Result, TinyLangError};
 use crate::gc::{GcHeap, GcStructRef};
@@ -62,6 +64,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
     pub fn with_io(output: W, input: R) -> Self {
         let env = Environment::new();
         install_builtins(&env);
+        install_builtin_interfaces(&env);
         Self {
             env,
             output,
@@ -131,6 +134,25 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                         fields: fields.clone(),
                     },
                 );
+                Ok(Value::Null)
+            }
+            Statement::InterfaceDecl { name, methods } => {
+                // 儲存 interface 定義，供 runtime 型別檢查與 impl 驗證使用。
+                self.env.borrow_mut().define_interface(
+                    name.clone(),
+                    InterfaceDef {
+                        name: name.clone(),
+                        methods: methods.clone(),
+                    },
+                );
+                Ok(Value::Null)
+            }
+            Statement::ImplInterface {
+                interface_name,
+                struct_name,
+                methods,
+            } => {
+                self.register_interface_impl(interface_name, struct_name, methods)?;
                 Ok(Value::Null)
             }
             Statement::EnumDecl { name, variants } => {
@@ -204,9 +226,11 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 body,
                 return_type,
             } => {
+                // method 可選擇顯式宣告 self，但 runtime 會用隱式 receiver 注入。
+                let normalized_params = strip_self_param(params)?;
                 let function = FunctionValue {
                     name: Some(format!("{struct_name}.{method_name}")),
-                    params: params.clone(),
+                    params: normalized_params,
                     return_type: return_type.clone(),
                     body: body.clone(),
                     closure: self.env.clone(),
@@ -331,6 +355,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             Expr::IntLit(value) => Ok(Value::Int(*value)),
             Expr::StringLit(value) => Ok(string_value(&mut self.heap, value.clone())),
             Expr::BoolLit(value) => Ok(Value::Bool(*value)),
+            Expr::NullLit => Ok(Value::Null),
             Expr::Ident(name) => Ok(self.env.borrow().get(name)?),
             Expr::StructInit { name, fields } => self.create_struct_instance(name, fields),
             Expr::EnumVariant { enum_name, variant, fields } => {
@@ -878,11 +903,33 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
     fn iterate_values(&mut self, value: Value) -> RuntimeResult<Vec<Value>> {
         match value {
             Value::Array(items) => Ok(self.heap.with_array(&items, |arr| arr.clone())),
+            Value::StructInstance(instance) => self.iterate_struct_values(instance),
             other => Err(Signal::Error(TinyLangError::runtime(format!(
-                "for loop expects Array iterable, got {}",
+                "for loop expects Array or Iterator iterable, got {}",
                 other.type_name_for_error()
             )))),
         }
+    }
+
+    fn iterate_struct_values(&mut self, instance: GcStructRef) -> RuntimeResult<Vec<Value>> {
+        let type_name = self.heap.with_struct_instance(&instance, |inst| inst.type_name.clone());
+        if !self.env.borrow().has_method(&type_name, "next") {
+            return Err(Signal::Error(TinyLangError::runtime(format!(
+                "Struct '{}' cannot be used in for/in because it has no next() method",
+                type_name
+            ))));
+        }
+
+        let method = self.env.borrow().get_method(&type_name, "next")?;
+        let mut values = Vec::new();
+        loop {
+            let next_value = self.call_method_with_values(&method, instance.clone(), Vec::new())?;
+            if matches!(next_value, Value::Null) {
+                break;
+            }
+            values.push(next_value);
+        }
+        Ok(values)
     }
 
     fn cast_to_int(&self, value: &Value) -> RuntimeResult<Value> {
@@ -1174,6 +1221,9 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
     }
 
     fn value_matches_type(&self, annotation: &TypeAnnotation, value: &Value) -> bool {
+        if matches!(value, Value::Null) {
+            return true;
+        }
         match annotation {
             TypeAnnotation::Any => true,
             TypeAnnotation::Int => matches!(value, Value::Int(_)),
@@ -1200,11 +1250,104 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             TypeAnnotation::Named(name) => match value {
                 Value::StructInstance(instance) => {
                     let instance = instance.clone();
-                    self.heap.with_struct_instance(&instance, |inst| &inst.type_name == name)
+                    self.heap.with_struct_instance(&instance, |inst| {
+                        &inst.type_name == name
+                            || (self.env.borrow().has_interface(name)
+                                && self
+                                    .env
+                                    .borrow()
+                                    .struct_implements_interface(&inst.type_name, name))
+                    })
                 }
                 _ => false,
             },
         }
+    }
+
+    fn register_interface_impl(
+        &mut self,
+        interface_name: &str,
+        struct_name: &str,
+        methods: &[Statement],
+    ) -> RuntimeResult<()> {
+        self.env.borrow().get_struct(struct_name)?;
+        let interface = self.env.borrow().get_interface(interface_name)?;
+
+        for method in methods {
+            let Statement::FnDecl {
+                name,
+                params,
+                return_type,
+                body,
+            } = method
+            else {
+                return Err(Signal::Error(TinyLangError::runtime(
+                    "impl block only accepts fn declarations",
+                )));
+            };
+
+            let Some((receiver, method_params)) = params.split_first() else {
+                return Err(Signal::Error(TinyLangError::runtime(format!(
+                    "Method '{}.{}' must declare self as the first parameter",
+                    struct_name, name
+                ))));
+            };
+            if receiver.0 != "self" {
+                return Err(Signal::Error(TinyLangError::runtime(format!(
+                    "Method '{}.{}' must declare self as the first parameter",
+                    struct_name, name
+                ))));
+            }
+
+            self.env.borrow_mut().define_method(
+                struct_name.to_string(),
+                name.clone(),
+                FunctionValue {
+                    name: Some(format!("{struct_name}.{name}")),
+                    params: method_params.to_vec(),
+                    return_type: return_type.clone(),
+                    body: body.clone(),
+                    closure: self.env.clone(),
+                },
+            );
+        }
+
+        self.validate_interface_impl(struct_name, &interface)?;
+        self.env
+            .borrow_mut()
+            .define_interface_impl(struct_name.to_string(), interface_name.to_string());
+        Ok(())
+    }
+
+    fn validate_interface_impl(&self, struct_name: &str, interface: &InterfaceDef) -> RuntimeResult<()> {
+        for method in &interface.methods {
+            let Some((receiver, expected_params)) = method.params.split_first() else {
+                return Err(Signal::Error(TinyLangError::runtime(format!(
+                    "Interface '{}.{}' must declare self as the first parameter",
+                    interface.name, method.name
+                ))));
+            };
+            if receiver.0 != "self" {
+                return Err(Signal::Error(TinyLangError::runtime(format!(
+                    "Interface '{}.{}' must declare self as the first parameter",
+                    interface.name, method.name
+                ))));
+            }
+
+            let actual = self.env.borrow().get_method(struct_name, &method.name).map_err(|_| {
+                Signal::Error(TinyLangError::runtime(format!(
+                    "Struct '{}' does not fully implement interface '{}': missing method '{}'",
+                    struct_name, interface.name, method.name
+                )))
+            })?;
+            if actual.params != expected_params || actual.return_type != method.return_type {
+                return Err(Signal::Error(TinyLangError::runtime(format!(
+                    "Method '{}.{}' does not match interface '{}'",
+                    struct_name, method.name, interface.name
+                ))));
+            }
+        }
+        Ok(())
     }
 
     fn expect_index(&self, value: Value) -> RuntimeResult<usize> {
@@ -1363,6 +1506,15 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
     }
 }
 
+fn strip_self_param(params: &[(String, Option<TypeAnnotation>)]) -> RuntimeResult<Vec<(String, Option<TypeAnnotation>)>> {
+    if let Some((first, rest)) = params.split_first() {
+        if first.0 == "self" {
+            return Ok(rest.to_vec());
+        }
+    }
+    Ok(params.to_vec())
+}
+
 fn install_builtins(env: &EnvRef) {
     let mut env = env.borrow_mut();
     env.define("len".into(), Value::Builtin(BuiltinFunction::Len));
@@ -1394,4 +1546,19 @@ fn install_builtins(env: &EnvRef) {
     env.define("reduce".into(), Value::Builtin(BuiltinFunction::Reduce));
     env.define("find".into(), Value::Builtin(BuiltinFunction::Find));
     env.define("assert".into(), Value::Builtin(BuiltinFunction::Assert));
+}
+
+fn install_builtin_interfaces(env: &EnvRef) {
+    // 內建 Iterator 介面讓 for/in 能透過 next() 協定工作。
+    env.borrow_mut().define_interface(
+        "Iterator".into(),
+        InterfaceDef {
+            name: "Iterator".into(),
+            methods: vec![InterfaceMethod {
+                name: "next".into(),
+                params: vec![("self".into(), None)],
+                return_type: Some(TypeAnnotation::Any),
+            }],
+        },
+    );
 }

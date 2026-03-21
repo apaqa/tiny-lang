@@ -1,7 +1,8 @@
 //! Parser。
 
 use crate::ast::{
-    BinaryOperator, EnumVariant, Expr, MatchArm, Pattern, Program, Statement, TypeAnnotation, UnaryOperator,
+    BinaryOperator, EnumVariant, Expr, InterfaceMethod, MatchArm, Pattern, Program, Statement,
+    TypeAnnotation, UnaryOperator,
 };
 use crate::error::{Result, TinyLangError};
 use crate::token::{SpannedToken, Token};
@@ -33,6 +34,8 @@ impl Parser {
         match &self.peek().token {
             Token::Import => self.parse_import_stmt(),
             Token::Struct => self.parse_struct_decl(),
+            Token::Interface => self.parse_interface_decl(),
+            Token::Impl => self.parse_impl_interface_decl(),
             Token::Enum => self.parse_enum_decl(),
             Token::Let => self.parse_let_decl(),
             Token::Fn => self.parse_fn_or_method_decl(),
@@ -80,6 +83,63 @@ impl Parser {
         }
         self.expect_token(Token::RBrace)?;
         Ok(Statement::StructDecl { name, fields })
+    }
+
+    fn parse_interface_decl(&mut self) -> Result<Statement> {
+        self.expect_token(Token::Interface)?;
+        let name = self.consume_ident()?;
+        self.expect_token(Token::LBrace)?;
+        let mut methods = Vec::new();
+        while !self.check(&Token::RBrace) && !self.is_at_end() {
+            self.expect_token(Token::Fn)?;
+            let method_name = self.consume_ident()?;
+            let params = self.parse_typed_parameter_list()?;
+            let return_type = if self.match_token(&Token::Arrow) {
+                Some(self.parse_type_annotation()?)
+            } else {
+                None
+            };
+            self.expect_token(Token::Semicolon)?;
+            methods.push(InterfaceMethod {
+                name: method_name,
+                params,
+                return_type,
+            });
+        }
+        self.expect_token(Token::RBrace)?;
+        Ok(Statement::InterfaceDecl { name, methods })
+    }
+
+    fn parse_impl_interface_decl(&mut self) -> Result<Statement> {
+        self.expect_token(Token::Impl)?;
+        let interface_name = self.consume_ident()?;
+        self.expect_token(Token::For)?;
+        let struct_name = self.consume_ident()?;
+        self.expect_token(Token::LBrace)?;
+        let mut methods = Vec::new();
+        while !self.check(&Token::RBrace) && !self.is_at_end() {
+            self.expect_token(Token::Fn)?;
+            let name = self.consume_ident()?;
+            let params = self.parse_typed_parameter_list()?;
+            let return_type = if self.match_token(&Token::Arrow) {
+                Some(self.parse_type_annotation()?)
+            } else {
+                None
+            };
+            let body = self.parse_block()?;
+            methods.push(Statement::FnDecl {
+                name,
+                params,
+                return_type,
+                body,
+            });
+        }
+        self.expect_token(Token::RBrace)?;
+        Ok(Statement::ImplInterface {
+            interface_name,
+            struct_name,
+            methods,
+        })
     }
 
     fn parse_enum_decl(&mut self) -> Result<Statement> {
@@ -598,6 +658,7 @@ impl Parser {
                     Token::BoolLit(value) => Ok(Expr::BoolLit(value)),
                     Token::True => Ok(Expr::BoolLit(true)),
                     Token::False => Ok(Expr::BoolLit(false)),
+                    Token::Null => Ok(Expr::NullLit),
                     Token::Ident(name) => {
                         if self.match_token(&Token::ColonColon) {
                             return self.parse_enum_variant_after_name(name);

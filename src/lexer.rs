@@ -254,6 +254,8 @@ impl Lexer {
             "let" => Token::Let,
             "fn" => Token::Fn,
             "struct" => Token::Struct,
+            "interface" => Token::Interface,
+            "impl" => Token::Impl,
             "enum" => Token::Enum,
             "new" => Token::New,
             "match" => Token::Match,
@@ -271,6 +273,7 @@ impl Lexer {
             "print" => Token::Print,
             "true" => Token::True,
             "false" => Token::False,
+            "null" => Token::Null,
             _ => Token::Ident(ident),
         };
 

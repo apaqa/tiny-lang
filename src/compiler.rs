@@ -240,6 +240,37 @@ impl Compiler {
                 self.emit(OpCode::Import(path.clone()));
                 Ok(())
             }
+            Statement::InterfaceDecl { .. } => Ok(()),
+            Statement::ImplInterface {
+                struct_name, methods, ..
+            } => {
+                // VM 目前不追蹤 interface metadata，但仍需要把 impl 內的方法編進 method table。
+                for method in methods {
+                    let Statement::FnDecl {
+                        name,
+                        params,
+                        return_type,
+                        body,
+                    } = method
+                    else {
+                        continue;
+                    };
+                    let method_params = params.iter().skip(1).cloned().collect();
+                    let function = self.compile_function(
+                        Some(format!("{struct_name}.{name}")),
+                        method_params,
+                        return_type.clone(),
+                        body,
+                        true,
+                    )?;
+                    self.chunk
+                        .methods
+                        .entry(struct_name.clone())
+                        .or_default()
+                        .insert(name.clone(), function);
+                }
+                Ok(())
+            }
             Statement::EnumDecl { .. } => {
                 // VM 模式下 enum 定義不需要生成 bytecode
                 // enum variant 的建立由 MakeEnumVariant 指令處理
@@ -262,9 +293,10 @@ impl Compiler {
                 body,
                 return_type,
             } => {
+                let method_params = strip_self_param(params);
                 let function = self.compile_function(
                     Some(format!("{struct_name}.{method_name}")),
-                    params.clone(),
+                    method_params,
                     return_type.clone(),
                     body,
                     true,
@@ -382,6 +414,10 @@ impl Compiler {
             }
             Expr::BoolLit(value) => {
                 let constant = self.push_constant(Value::Bool(*value));
+                self.emit(OpCode::Constant(constant));
+            }
+            Expr::NullLit => {
+                let constant = self.push_constant(Value::Null);
                 self.emit(OpCode::Constant(constant));
             }
             Expr::Ident(name) => {
@@ -1147,6 +1183,15 @@ fn collect_stmt_idents(stmt: &Statement, set: &mut HashSet<String>) {
                 collect_stmt_idents(s, set);
             }
         }
+        Statement::ImplInterface { methods, .. } => {
+            for method in methods {
+                if let Statement::FnDecl { body, .. } = method {
+                    for s in body {
+                        collect_stmt_idents(s, set);
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -1206,6 +1251,15 @@ fn collect_expr_idents(expr: &Expr, set: &mut HashSet<String>) {
 }
 
 /// 把 chunk 反組譯成人類可讀的文字格式。
+fn strip_self_param(params: &[(String, Option<TypeAnnotation>)]) -> Vec<(String, Option<TypeAnnotation>)> {
+    if let Some((first, rest)) = params.split_first() {
+        if first.0 == "self" {
+            return rest.to_vec();
+        }
+    }
+    params.to_vec()
+}
+
 pub fn disassemble(chunk: &Chunk) -> String {
     let mut lines = Vec::new();
     for (index, opcode) in chunk.code.iter().enumerate() {
