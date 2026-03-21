@@ -86,4 +86,4 @@ match p.x {
 
 ## 測試數量
 
-目前共有 **126** 個測試，涵蓋 lexer、parser、interpreter、compiler、VM、型別、struct、method、match、GC、closures、enum、靜態型別檢查器與其他標準功能。
+目前共有 **148** 個測試，涵蓋 lexer、parser、interpreter、compiler、VM、型別、struct、method、match、GC、closures、enum、靜態型別檢查器、VM/import/try-catch 一致性與其他標準功能。

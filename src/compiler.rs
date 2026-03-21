@@ -4,14 +4,13 @@
 //! 編譯器採用 stack machine 模型，區域變數以 slot index 管理。
 //! Phase 7 新增：閉包 upvalue 分析與編譯、enum 支援。
 
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ast::{
     BinaryOperator, Expr, MatchArm, Pattern, Program, Statement, TypeAnnotation, UnaryOperator,
 };
-use crate::environment::{CompiledFunction, StructDef, Value};
+use crate::environment::{CaptureSource, CompiledFunction, StructDef, Value};
 use crate::error::{Result, TinyLangError};
 use crate::gc::GcHeap;
 
@@ -32,6 +31,14 @@ pub enum OpCode {
     CloseUpvalue,
     /// 從常數池建立閉包，並從 stack 上取得 capture_names.len() 個捕獲值
     MakeClosure(usize),
+    /// 中文註解：進入 try 區塊時記住 catch 的跳轉位置。
+    TryBegin(usize),
+    /// 中文註解：正常離開 try 區塊時移除對應的 try frame。
+    TryEnd,
+    /// 中文註解：主動拋出目前 stack 頂端的錯誤字串。
+    Throw,
+    /// 中文註解：在 VM 內載入並執行另一個 tiny 檔案。
+    Import(String),
     Add,
     Sub,
     Mul,
@@ -146,7 +153,13 @@ impl Default for Compiler {
 
 impl Compiler {
     pub fn compile_program(program: &Program) -> Result<Chunk> {
+        Self::compile_program_with_heap(program, GcHeap::new())
+    }
+
+    pub fn compile_program_with_heap(program: &Program, heap: GcHeap) -> Result<Chunk> {
         let mut compiler = Self::default();
+        // 中文註解：讓編譯出來的常數直接落在既有 heap，import 時就能和目前 VM 共用物件。
+        compiler.chunk.heap = heap;
         for statement in program {
             compiler.compile_statement(statement)?;
         }
@@ -223,9 +236,10 @@ impl Compiler {
 
     fn compile_statement(&mut self, statement: &Statement) -> Result<()> {
         match statement {
-            Statement::Import { .. } => Err(TinyLangError::runtime(
-                "bytecode VM does not support import yet; use tree-walking interpreter",
-            )),
+            Statement::Import { path } => {
+                self.emit(OpCode::Import(path.clone()));
+                Ok(())
+            }
             Statement::EnumDecl { .. } => {
                 // VM 模式下 enum 定義不需要生成 bytecode
                 // enum variant 的建立由 MakeEnumVariant 指令處理
@@ -272,6 +286,7 @@ impl Compiler {
                     self.emit(OpCode::SetGlobal(name.clone()));
                 } else {
                     self.add_local(name.clone());
+                    local.captured = true;
                 }
                 Ok(())
             }
@@ -336,9 +351,11 @@ impl Compiler {
             } => self.compile_for_loop(variable, iterable, body),
             Statement::Break => self.compile_break(),
             Statement::Continue => self.compile_continue(),
-            Statement::TryCatch { .. } => Err(TinyLangError::runtime(
-                "bytecode VM does not support try/catch yet; use tree-walking interpreter",
-            )),
+            Statement::TryCatch {
+                try_body,
+                catch_var,
+                catch_body,
+            } => self.compile_try_catch(try_body, catch_var, catch_body),
             Statement::Match { expr, arms } => self.compile_match(expr, arms),
             Statement::Print(expr) => {
                 self.compile_expr(expr)?;
@@ -455,42 +472,75 @@ impl Compiler {
                 self.emit(OpCode::MakeEnumVariant(enum_name.clone(), variant.clone(), field_names));
             }
         }
+        if !function.capture_sources.is_empty() {
+            self.emit(OpCode::MakeClosure(const_idx));
+        }
+        if !function.capture_sources.is_empty() {
+            self.emit(OpCode::MakeClosure(const_idx));
+        }
         Ok(())
     }
 
     /// 編譯 lambda 表達式，分析捕獲的外部 local 變數，生成 upvalue。
     fn compile_lambda(&mut self, params: &[String], body: &[Statement]) -> Result<()> {
         // 收集 lambda 體中所有引用的識別符
+        // 中文註解：lambda 需要同時分析 local 與外層 upvalue，才能正確支援巢狀 closure。
         let all_refs = collect_body_idents(body);
 
         // 排除 lambda 自身的參數（它們是 bound 的）
+    fn compile_lambda(&mut self, params: &[String], body: &[Statement]) -> Result<()> {
+        let all_refs = collect_body_idents(body);
         let param_set: HashSet<&str> = params.iter().map(|p| p.as_str()).collect();
 
         // 找出在外部作用域 locals 中定義的識別符 → 這些是需要捕獲的 upvalue
-        let mut captures: Vec<(usize, String)> = all_refs
+        let mut captures: Vec<(String, CaptureSource)> = all_refs
             .iter()
             .filter(|name| !param_set.contains(name.as_str()))
-            .filter_map(|name| self.resolve_local(name).map(|slot| (slot, name.clone())))
+            .filter_map(|name| {
+                if let Some(slot) = self.resolve_local(name) {
+                    Some((name.clone(), CaptureSource::Local(slot)))
+                } else {
+                    self.resolve_upvalue(name)
+                        .map(|index| (name.clone(), CaptureSource::Upvalue(index)))
+                }
+            })
             .collect();
 
         // 按 slot 排序確保一致的順序
-        captures.sort_by_key(|(slot, _)| *slot);
-        captures.dedup_by_key(|(slot, _)| *slot);
+        // 中文註解：用固定順序產生 capture metadata，避免測試因集合順序飄動。
+        captures.sort_by(|left, right| match (&left.1, &right.1) {
+        captures.sort_by(|left, right| match (&left.1, &right.1) {
+            (CaptureSource::Local(a), CaptureSource::Local(b)) => a.cmp(b).then(left.0.cmp(&right.0)),
+            (CaptureSource::Upvalue(a), CaptureSource::Upvalue(b)) => {
+                a.cmp(b).then(left.0.cmp(&right.0))
+            }
+            (CaptureSource::Local(_), CaptureSource::Upvalue(_)) => std::cmp::Ordering::Less,
+            (CaptureSource::Upvalue(_), CaptureSource::Local(_)) => std::cmp::Ordering::Greater,
+        });
+        captures.dedup_by(|left, right| left.1 == right.1);
 
-        let capture_names: Vec<String> = captures.iter().map(|(_, name)| name.clone()).collect();
+        let capture_names: Vec<String> = captures.iter().map(|(name, _)| name.clone()).collect();
+        let capture_sources: Vec<CaptureSource> =
+            captures.iter().map(|(_, source)| source.clone()).collect();
 
         // 標記被捕獲的 locals，讓 end_scope 生成 CloseUpvalue 而非 Pop
-        for (slot, _) in &captures {
-            if let Some(local) = self.locals.get_mut(*slot) {
-                local.captured = true;
+        for (_, source) in &captures {
+            if let CaptureSource::Local(slot) = source {
+                if let Some(local) = self.locals.get_mut(*slot) {
+                    local.captured = true;
+                    // 中文註解：被 closure 捕獲的 local 在離開 scope 時不能直接丟掉。
+                    local.captured = true;
+                }
             }
         }
 
         // 建立 lambda 的參數列表（lambda 沒有型別註記）
         let param_pairs: Vec<(String, Option<TypeAnnotation>)> =
+        let param_pairs: Vec<(String, Option<TypeAnnotation>)> =
             params.iter().map(|p| (p.clone(), None)).collect();
 
         // 編譯閉包函式（使用帶 upvalue_names 的內部 compiler）
+        let function = self.compile_closure_function(
         let function = self.compile_closure_function(
             None,
             param_pairs,
@@ -498,19 +548,22 @@ impl Compiler {
             body,
             false,
             capture_names.clone(),
+            capture_sources,
         )?;
 
-        let const_idx = self.push_constant(Value::CompiledFunction(function));
+        let const_idx = self.push_constant(Value::CompiledFunction(function.clone()));
 
-        if captures.is_empty() {
+        if function.capture_sources.is_empty() {
+            self.emit(OpCode::Constant(const_idx));
             // 無捕獲變數：直接作為普通函式常數使用（不需要 Closure 包裝）
             self.emit(OpCode::Constant(const_idx));
         } else {
             // 有捕獲變數：先推入各捕獲值，再發出 MakeClosure
             // VM 的 MakeClosure 會從 stack 取出這些值建立 Closure 物件
-            for (slot, _) in &captures {
-                self.emit(OpCode::GetLocal(*slot));
-            }
+            // 中文註解：MakeClosure 會依照 capture_sources 在 VM 端抓 shared cell。
+            self.emit(OpCode::MakeClosure(const_idx));
+        }
+        if !function.capture_sources.is_empty() {
             self.emit(OpCode::MakeClosure(const_idx));
         }
 
@@ -519,6 +572,7 @@ impl Compiler {
 
     /// 編譯帶有 upvalue 支援的閉包函式。
     fn compile_closure_function(
+    fn compile_closure_function(
         &mut self,
         name: Option<String>,
         params: Vec<(String, Option<TypeAnnotation>)>,
@@ -526,6 +580,7 @@ impl Compiler {
         body: &[Statement],
         takes_self: bool,
         capture_names: Vec<String>,
+        capture_sources: Vec<CaptureSource>,
     ) -> Result<Rc<CompiledFunction>> {
         let mut compiler = Compiler::new_closure(
             params.clone(),
@@ -544,6 +599,7 @@ impl Compiler {
 
         // 確保函式有 return（不管有沒有 return 語句）
         let null_constant = compiler.push_constant(Value::Null);
+        let null_constant = compiler.push_constant(Value::Null);
         compiler.emit(OpCode::Constant(null_constant));
         compiler.emit(OpCode::Return);
 
@@ -558,6 +614,7 @@ impl Compiler {
             local_count: compiler.max_local_count,
             takes_self,
             capture_names,
+            capture_sources,
         }))
     }
 
@@ -674,6 +731,39 @@ impl Compiler {
         self.patch_break_jumps(self.chunk.code.len());
         self.loop_stack.pop();
         self.end_scope();
+        Ok(())
+    }
+
+    fn compile_try_catch(
+        &mut self,
+        try_body: &[Statement],
+        catch_var: &str,
+        catch_body: &[Statement],
+    ) -> Result<()> {
+        let try_begin = self.emit_jump(OpCode::TryBegin(usize::MAX));
+
+        // 中文註解：try 區塊使用獨立 scope，和 interpreter 的 block 語意保持一致。
+        self.begin_scope();
+        for statement in try_body {
+            self.compile_statement(statement)?;
+        }
+        self.end_scope();
+
+        self.emit(OpCode::TryEnd);
+        let end_jump = self.emit_jump(OpCode::Jump(usize::MAX));
+
+        let catch_ip = self.chunk.code.len();
+        self.patch_jump(try_begin, catch_ip);
+
+        // 中文註解：VM 進入 catch 前會把錯誤字串推到 stack，這裡直接把它綁到 local。
+        self.begin_scope();
+        self.add_local(catch_var.to_string());
+        for statement in catch_body {
+            self.compile_statement(statement)?;
+        }
+        self.end_scope();
+
+        self.patch_jump(end_jump, self.chunk.code.len());
         Ok(())
     }
 
@@ -802,7 +892,11 @@ impl Compiler {
             }
         }
 
-        self.emit(OpCode::RuntimeError("match expression did not match any arm".into()));
+        // 中文註解：用 Throw 走統一的錯誤攔截流程，讓 try/catch 可以接住 match 失敗。
+        let error_text = self.chunk.heap.alloc_string("Runtime error: match expression did not match any arm".into());
+        let constant = self.push_constant(Value::String(error_text));
+        self.emit(OpCode::Constant(constant));
+        self.emit(OpCode::Throw);
         let end = self.chunk.code.len();
         for jump in end_jumps {
             self.patch_jump(jump, end);
@@ -912,6 +1006,7 @@ impl Compiler {
             local_count: compiler.max_local_count,
             takes_self,
             capture_names: Vec::new(),
+            capture_sources: Vec::new(),
         }))
     }
 
@@ -971,7 +1066,9 @@ impl Compiler {
 
     fn patch_jump(&mut self, instruction_index: usize, target: usize) {
         match &mut self.chunk.code[instruction_index] {
-            OpCode::Jump(destination) | OpCode::JumpIfFalse(destination) => *destination = target,
+            OpCode::Jump(destination)
+            | OpCode::JumpIfFalse(destination)
+            | OpCode::TryBegin(destination) => *destination = target,
             _ => panic!("attempted to patch non-jump opcode"),
         }
     }
@@ -1012,12 +1109,12 @@ impl Compiler {
 }
 
 /// 收集語句列表中所有引用的識別符名稱（用於 upvalue 分析）。
-fn collect_body_idents(stmts: &[Statement]) -> HashSet<String> {
+fn collect_body_idents(stmts: &[Statement]) -> BTreeSet<String> {
     let mut set = HashSet::new();
     for stmt in stmts {
         collect_stmt_idents(stmt, &mut set);
     }
-    set
+    set.into_iter().collect()
 }
 
 fn collect_stmt_idents(stmt: &Statement, set: &mut HashSet<String>) {

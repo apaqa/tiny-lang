@@ -72,6 +72,14 @@ pub struct BoundMethodValue {
 
 /// bytecode VM 使用的函式原型。
 #[derive(Debug, Clone)]
+/// 中文註解：closure 在建立時要知道捕獲來源，才能共享正確的 upvalue cell。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureSource {
+    Local(usize),
+    Upvalue(usize),
+}
+
+#[derive(Debug, Clone)]
 pub struct CompiledFunction {
     pub name: Option<String>,
     pub params: Vec<(String, Option<TypeAnnotation>)>,
@@ -80,6 +88,8 @@ pub struct CompiledFunction {
     pub local_count: usize,
     pub takes_self: bool,
     pub capture_names: Vec<String>,
+    /// 中文註解：描述每個捕獲值是來自 local 還是外層 upvalue。
+    pub capture_sources: Vec<CaptureSource>,
 }
 
 impl CompiledFunction {
@@ -378,6 +388,7 @@ impl PartialEq for CompiledFunction {
             && self.local_count == other.local_count
             && self.takes_self == other.takes_self
             && self.capture_names == other.capture_names
+            && self.capture_sources == other.capture_sources
             && self.chunk == other.chunk
     }
 }

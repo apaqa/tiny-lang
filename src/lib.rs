@@ -63,6 +63,21 @@ pub fn compile_and_run(source: &str) -> Result<()> {
     Ok(())
 }
 
+/// 中文註解：檔案模式下要把 import 的基準目錄設成來源檔所在資料夾。
+pub fn compile_and_run_file(path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
+    let source = std::fs::read_to_string(path)?;
+    let program = parse_source(&source)?;
+    type_check(&program)?;
+    let chunk = compiler::Compiler::compile_program(&program)?;
+    let mut vm = VM::new();
+    if let Some(parent) = path.parent() {
+        vm.set_current_dir(parent);
+    }
+    vm.run(chunk)?;
+    Ok(())
+}
+
 /// 執行檔案，支援 import（先進行靜態型別檢查）。
 pub fn run_file(path: impl AsRef<Path>) -> Result<()> {
     // 先讀取並型別檢查，錯誤就提前回報

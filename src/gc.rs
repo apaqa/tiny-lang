@@ -94,7 +94,7 @@ pub struct GcStats {
 }
 
 /// 垃圾回收堆。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GcHeap {
     storage: Rc<RefCell<HeapStorage>>,
     pub total_allocations: usize,

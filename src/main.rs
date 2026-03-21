@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use tiny_lang::compiler::{Compiler, disassemble};
 use tiny_lang::error::{Result, TinyLangError};
 use tiny_lang::interpreter::Interpreter;
-use tiny_lang::{compile_and_run, parse_source, run_file};
+use tiny_lang::{compile_and_run, compile_and_run_file, parse_source, run_file};
 
 fn main() {
     if let Err(err) = run() {
@@ -55,7 +55,7 @@ fn run() -> Result<()> {
         }
 
         if use_vm {
-            compile_and_run(&source)?;
+            compile_and_run_file(&path)?;
         } else {
             run_file(path)?;
         }

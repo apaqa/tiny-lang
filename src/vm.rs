@@ -4,15 +4,17 @@
 //! Phase 7 新增：閉包 upvalue 支援、enum 指令、自動 GC 觸發。
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Stdout, Write};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::ast::TypeAnnotation;
 use crate::compiler::{Chunk, OpCode};
 use crate::environment::{
     array_value, closure_value, enum_variant_value, map_value, render_value, string_value,
-    struct_instance_value, CompiledFunction, NativeFunction, StructDef, Value, VmBoundMethodValue,
+    struct_instance_value, CaptureSource, CompiledFunction, NativeFunction, StructDef, Value,
+    VmBoundMethodValue,
 };
 use crate::error::{Result, TinyLangError};
 use crate::gc::GcHeap;
@@ -25,6 +27,17 @@ pub struct CallFrame {
     pub slot_offset: usize,
     /// 閉包的 upvalue 列表（普通函式為空）
     pub upvalues: Vec<Rc<RefCell<Value>>>,
+    /// 中文註解：import 腳本結束後要把 current_dir 還原。
+}
+
+#[derive(Debug, Clone)]
+struct TryFrame {
+    /// 中文註解：catch block 的指令位置。
+    catch_ip: usize,
+    /// 中文註解：發生錯誤時要把 value stack 回滾到 try 開始前的深度。
+    stack_depth: usize,
+    /// 中文註解：發生錯誤時保留到哪一層 call frame。
+    frame_depth: usize,
 }
 
 /// Bytecode 虛擬機。
@@ -34,6 +47,11 @@ pub struct VM<W: Write> {
     pub globals: HashMap<String, Value>,
     structs: HashMap<String, StructDef>,
     methods: HashMap<String, HashMap<String, Rc<CompiledFunction>>>,
+    try_stack: Vec<TryFrame>,
+    open_upvalues: HashMap<usize, Rc<RefCell<Value>>>,
+    frame_restore_dirs: Vec<Option<PathBuf>>,
+    current_dir: PathBuf,
+    imported_files: HashSet<PathBuf>,
     output: W,
     heap: GcHeap,
 }
@@ -52,6 +70,11 @@ impl<W: Write> VM<W> {
             globals: HashMap::new(),
             structs: HashMap::new(),
             methods: HashMap::new(),
+            try_stack: Vec::new(),
+            open_upvalues: HashMap::new(),
+            frame_restore_dirs: Vec::new(),
+            current_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            imported_files: HashSet::new(),
             output,
             heap: GcHeap::new(),
         };
@@ -60,7 +83,16 @@ impl<W: Write> VM<W> {
     }
 
     /// 執行整個 chunk。
+    pub fn set_current_dir(&mut self, path: impl AsRef<Path>) {
+    pub fn set_current_dir(&mut self, path: impl AsRef<Path>) {
+        self.current_dir = path.as_ref().to_path_buf();
+    }
+
     pub fn run(&mut self, mut chunk: Chunk) -> Result<Value> {
+        // 中文註解：新的執行入口會統一走 try/catch、import 與 shared upvalue 的流程。
+        // 中文註解：新的執行入口會統一走 try/catch、import 與 shared upvalue 的流程。
+        return self.run_internal(chunk);
+        return self.run_internal(chunk);
         self.stack.clear();
         self.frames.clear();
         self.structs = chunk.structs.clone();
@@ -79,6 +111,7 @@ impl<W: Write> VM<W> {
             local_count: 0,
             takes_self: false,
             capture_names: Vec::new(),
+            capture_sources: Vec::new(),
         });
 
         self.frames.push(CallFrame {
@@ -407,6 +440,333 @@ impl<W: Write> VM<W> {
         }
     }
 
+    fn run_internal(&mut self, chunk: Chunk) -> Result<Value> {
+        self.stack.clear();
+        self.frames.clear();
+        self.try_stack.clear();
+        self.open_upvalues.clear();
+        self.frame_restore_dirs.clear();
+        self.structs = chunk.structs.clone();
+        self.methods = chunk.methods.clone();
+        self.heap = chunk.heap.clone();
+
+        self.push_script_frame(chunk, "<script>", None);
+
+        loop {
+            let instruction = match self.next_instruction() {
+                Some(instruction) => instruction,
+                None => return Ok(Value::Null),
+            };
+
+            match self.execute_instruction(instruction) {
+                Ok(Some(value)) => return Ok(value),
+                Ok(None) => {}
+                Err(err) => {
+                    if !self.handle_runtime_error(err.clone())? {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    }
+
+    fn next_instruction(&mut self) -> Option<OpCode> {
+        let frame = self.frames.last_mut()?;
+        if frame.ip >= frame.function.chunk.code.len() {
+            return Some(OpCode::Halt);
+        }
+        let opcode = frame.function.chunk.code[frame.ip].clone();
+        frame.ip += 1;
+        Some(opcode)
+    }
+
+    fn push_script_frame(&mut self, chunk: Chunk, name: &str, restore_dir: Option<PathBuf>) {
+        let script = Rc::new(CompiledFunction {
+            name: Some(name.into()),
+            params: Vec::new(),
+            return_type: None,
+            chunk: Rc::new(chunk),
+            local_count: 0,
+            takes_self: false,
+            capture_names: Vec::new(),
+            capture_sources: Vec::new(),
+        });
+
+        self.frames.push(CallFrame {
+            function: script,
+            ip: 0,
+            slot_offset: self.stack.len(),
+            upvalues: Vec::new(),
+        });
+        self.frame_restore_dirs.push(restore_dir);
+    }
+
+    fn execute_instruction(&mut self, instruction: OpCode) -> Result<Option<Value>> {
+        match instruction {
+            OpCode::Constant(index) => {
+                let value = self.current_chunk().constants[index].clone();
+                self.stack.push(value);
+            }
+            OpCode::Pop => {
+                self.pop_value()?;
+            }
+            OpCode::GetLocal(slot) => {
+                let value = self.read_local(slot)?;
+                self.stack.push(value);
+            }
+            OpCode::SetLocal(slot) => {
+                let value = self.pop_value()?;
+                self.write_local(slot, value)?;
+            }
+            OpCode::GetGlobal(name) => {
+                let value = self
+                    .globals
+                    .get(&name)
+                    .cloned()
+                    .ok_or_else(|| TinyLangError::runtime(format!("Variable '{name}' not defined")))?;
+                self.stack.push(value);
+            }
+            OpCode::SetGlobal(name) => {
+                let value = self.pop_value()?;
+                self.globals.insert(name, value);
+            }
+            OpCode::GetUpvalue(index) => {
+                let value = self
+                    .current_frame()
+                    .upvalues
+                    .get(index)
+                    .ok_or_else(|| TinyLangError::runtime(format!("Upvalue index {index} out of bounds")))?
+                    .borrow()
+                    .clone();
+                self.stack.push(value);
+            }
+            OpCode::SetUpvalue(index) => {
+                let value = self.pop_value()?;
+                let cell = self
+                    .current_frame()
+                    .upvalues
+                    .get(index)
+                    .ok_or_else(|| TinyLangError::runtime(format!("Upvalue index {index} out of bounds")))?
+                    .clone();
+                *cell.borrow_mut() = value;
+            }
+            OpCode::CloseUpvalue => {
+                self.close_top_upvalue()?;
+            }
+            OpCode::MakeClosure(const_idx) => {
+                let function = match &self.current_chunk().constants[const_idx] {
+                    Value::CompiledFunction(f) => f.clone(),
+                    _ => return Err(TinyLangError::runtime("MakeClosure: expected CompiledFunction constant")),
+                };
+                let captured = self.capture_cells(&function)?;
+                let closure = closure_value(&mut self.heap, function, captured);
+                self.stack.push(closure);
+                self.try_collect_garbage();
+            }
+            OpCode::TryBegin(catch_ip) => {
+                self.try_stack.push(TryFrame {
+                    catch_ip,
+                    stack_depth: self.stack.len(),
+                    frame_depth: self.frames.len(),
+                });
+            }
+            OpCode::TryEnd => {
+                self.try_stack.pop();
+            }
+            OpCode::Throw => {
+                let value = self.pop_value()?;
+                let message = render_value(&self.heap, &value);
+                return Err(TinyLangError::runtime(message));
+            }
+            OpCode::Import(path) => {
+                self.execute_import(&path)?;
+            }
+            OpCode::Add => self.execute_add()?,
+            OpCode::Sub => self.execute_int_binary("subtract", |a, b| a - b)?,
+            OpCode::Mul => self.execute_int_binary("multiply", |a, b| a * b)?,
+            OpCode::Div => {
+                let (a, b) = self.pop_int_pair("divide")?;
+                if b == 0 {
+                    return Err(TinyLangError::runtime("Cannot divide by zero"));
+                }
+                self.stack.push(Value::Int(a / b));
+            }
+            OpCode::Mod => {
+                let (a, b) = self.pop_int_pair("modulo")?;
+                if b == 0 {
+                    return Err(TinyLangError::runtime("Cannot modulo by zero"));
+                }
+                self.stack.push(Value::Int(a % b));
+            }
+            OpCode::Equal => {
+                let right = self.pop_value()?;
+                let left = self.pop_value()?;
+                self.stack.push(Value::Bool(self.values_equal(&left, &right)));
+            }
+            OpCode::NotEqual => {
+                let right = self.pop_value()?;
+                let left = self.pop_value()?;
+                self.stack.push(Value::Bool(!self.values_equal(&left, &right)));
+            }
+            OpCode::Less => self.execute_int_compare("<", |a, b| a < b)?,
+            OpCode::Greater => self.execute_int_compare(">", |a, b| a > b)?,
+            OpCode::LessEqual => self.execute_int_compare("<=", |a, b| a <= b)?,
+            OpCode::GreaterEqual => self.execute_int_compare(">=", |a, b| a >= b)?,
+            OpCode::Not => {
+                let value = self.pop_value()?;
+                self.stack.push(Value::Bool(!value.is_truthy()));
+            }
+            OpCode::Negate => {
+                let value = self.pop_value()?;
+                match value {
+                    Value::Int(number) => self.stack.push(Value::Int(-number)),
+                    other => {
+                        return Err(TinyLangError::runtime(format!(
+                            "Cannot negate {}",
+                            other.type_name_for_error()
+                        )))
+                    }
+                }
+            }
+            OpCode::Jump(target) | OpCode::Loop(target) => {
+                self.current_frame_mut().ip = target;
+            }
+            OpCode::JumpIfFalse(target) => {
+                if !self.peek_value()?.is_truthy() {
+                    self.current_frame_mut().ip = target;
+                }
+            }
+            OpCode::Call(arg_count) => self.execute_call(arg_count)?,
+            OpCode::Return => {
+                let value = self.handle_return()?;
+                return Ok(Some(value));
+            }
+            OpCode::Print => {
+                let value = self.pop_value()?;
+                let rendered = render_value(&self.heap, &value);
+                writeln!(self.output, "{rendered}").map_err(|err| TinyLangError::io(err.to_string()))?;
+            }
+            OpCode::MakeArray(count) => {
+                let mut items = Vec::with_capacity(count);
+                for _ in 0..count {
+                    items.push(self.pop_value()?);
+                }
+                items.reverse();
+                self.stack.push(array_value(&mut self.heap, items));
+                self.try_collect_garbage();
+            }
+            OpCode::MakeMap(count) => {
+                let mut entries = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let value = self.pop_value()?;
+                    let key = self.pop_value()?;
+                    entries.push((self.expect_map_key(key)?, value));
+                }
+                entries.reverse();
+                let mut map = HashMap::new();
+                for (key, value) in entries {
+                    map.insert(key, value);
+                }
+                self.stack.push(map_value(&mut self.heap, map));
+                self.try_collect_garbage();
+            }
+            OpCode::Index => {
+                let index = self.pop_value()?;
+                let target = self.pop_value()?;
+                self.stack.push(self.read_index(target, index)?);
+            }
+            OpCode::SetIndex => {
+                let value = self.pop_value()?;
+                let index = self.pop_value()?;
+                let target = self.pop_value()?;
+                self.assign_index(target, index, value)?;
+            }
+            OpCode::GetField(field) => {
+                let object = self.pop_value()?;
+                self.stack.push(self.read_field_or_method(object, &field)?);
+            }
+            OpCode::SetField(field) => {
+                let value = self.pop_value()?;
+                let object = self.pop_value()?;
+                self.assign_field(object, &field, value)?;
+            }
+            OpCode::MakeStruct(type_name, field_count) => {
+                let struct_def = self
+                    .structs
+                    .get(&type_name)
+                    .cloned()
+                    .ok_or_else(|| TinyLangError::runtime(format!("Struct '{type_name}' not defined")))?;
+                if struct_def.fields.len() != field_count {
+                    return Err(TinyLangError::runtime(format!(
+                        "Struct '{}' expects {} fields, got {}",
+                        type_name,
+                        struct_def.fields.len(),
+                        field_count
+                    )));
+                }
+
+                let mut values = Vec::with_capacity(field_count);
+                for _ in 0..field_count {
+                    values.push(self.pop_value()?);
+                }
+                values.reverse();
+
+                let mut fields = HashMap::new();
+                for ((field_name, annotation), value) in struct_def.fields.iter().zip(values.into_iter()) {
+                    if let Some(annotation) = annotation {
+                        self.ensure_type_matches(annotation, &value)?;
+                    }
+                    fields.insert(field_name.clone(), value);
+                }
+
+                self.stack.push(struct_instance_value(&mut self.heap, type_name, fields));
+            }
+            OpCode::MakeEnumVariant(enum_name, variant_name, field_names) => {
+                let mut values: Vec<Value> = (0..field_names.len())
+                    .map(|_| self.pop_value())
+                    .collect::<Result<_>>()?;
+                values.reverse();
+                let mut fields = HashMap::new();
+                for (name, value) in field_names.iter().zip(values.into_iter()) {
+                    fields.insert(name.clone(), value);
+                }
+                self.stack
+                    .push(enum_variant_value(&mut self.heap, enum_name, variant_name, fields));
+            }
+            OpCode::CheckEnumVariant(enum_name, variant_name) => {
+                let value = self.pop_value()?;
+                let matches = match &value {
+                    Value::EnumVariant(reference) => self.heap.with_enum_variant(reference, |ev| {
+                        ev.enum_name == enum_name && ev.variant_name == variant_name
+                    }),
+                    _ => false,
+                };
+                self.stack.push(Value::Bool(matches));
+            }
+            OpCode::GetEnumField(field_name) => {
+                let value = self.pop_value()?;
+                match value {
+                    Value::EnumVariant(reference) => {
+                        let field_value = self.heap.with_enum_variant(&reference, |ev| {
+                            ev.fields.get(&field_name).cloned().unwrap_or(Value::Null)
+                        });
+                        self.stack.push(field_value);
+                    }
+                    other => {
+                        return Err(TinyLangError::runtime(format!(
+                            "GetEnumField expects EnumVariant, got {}",
+                            other.type_name_for_error()
+                        )))
+                    }
+                }
+            }
+            OpCode::RuntimeError(message) => return Err(TinyLangError::runtime(message)),
+            OpCode::Halt => return Ok(Some(self.stack.last().cloned().unwrap_or(Value::Null))),
+        }
+
+        Ok(None)
+    }
+
     fn current_frame(&self) -> &CallFrame {
         self.frames.last().expect("vm must have an active frame")
     }
@@ -417,6 +777,184 @@ impl<W: Write> VM<W> {
 
     fn current_chunk(&self) -> &Chunk {
         &self.current_frame().function.chunk
+    }
+
+    fn read_local(&self, slot: usize) -> Result<Value> {
+        let index = self.current_frame().slot_offset + slot;
+        if let Some(cell) = self.open_upvalues.get(&index) {
+            return Ok(cell.borrow().clone());
+        }
+        self.stack
+            .get(index)
+            .cloned()
+            .ok_or_else(|| TinyLangError::runtime(format!("Local slot {slot} out of bounds")))
+    }
+
+    fn write_local(&mut self, slot: usize, value: Value) -> Result<()> {
+        let index = self.current_frame().slot_offset + slot;
+        if index >= self.stack.len() {
+            return Err(TinyLangError::runtime(format!("Local slot {slot} out of bounds")));
+        }
+        self.stack[index] = value.clone();
+        if let Some(cell) = self.open_upvalues.get(&index) {
+            *cell.borrow_mut() = value;
+        }
+        Ok(())
+    }
+
+    fn capture_cells(&mut self, function: &Rc<CompiledFunction>) -> Result<Vec<Rc<RefCell<Value>>>> {
+        let mut captured = Vec::with_capacity(function.capture_sources.len());
+        for source in &function.capture_sources {
+            match source {
+                CaptureSource::Local(slot) => captured.push(self.capture_local_cell(*slot)?),
+                CaptureSource::Upvalue(index) => {
+                    let cell = self
+                        .current_frame()
+                        .upvalues
+                        .get(*index)
+                        .ok_or_else(|| TinyLangError::runtime(format!("Upvalue index {index} out of bounds")))?
+                        .clone();
+                    captured.push(cell);
+                }
+            }
+        }
+        Ok(captured)
+    }
+
+    fn capture_local_cell(&mut self, slot: usize) -> Result<Rc<RefCell<Value>>> {
+        let index = self.current_frame().slot_offset + slot;
+        if let Some(cell) = self.open_upvalues.get(&index) {
+            return Ok(cell.clone());
+        }
+        let value = self
+            .stack
+            .get(index)
+            .cloned()
+            .ok_or_else(|| TinyLangError::runtime(format!("Local slot {slot} out of bounds")))?;
+        let cell = Rc::new(RefCell::new(value));
+        self.open_upvalues.insert(index, cell.clone());
+        Ok(cell)
+    }
+
+    fn close_top_upvalue(&mut self) -> Result<()> {
+        let top_index = self
+            .stack
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| TinyLangError::runtime("VM stack underflow"))?;
+        if let Some(cell) = self.open_upvalues.remove(&top_index) {
+            *cell.borrow_mut() = self.stack[top_index].clone();
+        }
+        self.stack.pop();
+        Ok(())
+    }
+
+    fn close_upvalues_from(&mut self, start: usize) {
+        let mut slots: Vec<usize> = self
+            .open_upvalues
+            .keys()
+            .copied()
+            .filter(|slot| *slot >= start)
+            .collect();
+        slots.sort_unstable();
+        for slot in slots {
+            if let Some(cell) = self.open_upvalues.remove(&slot) {
+                if let Some(value) = self.stack.get(slot).cloned() {
+                    *cell.borrow_mut() = value;
+                }
+            }
+        }
+    }
+
+    fn handle_return(&mut self) -> Result<Value> {
+        let return_value = self.pop_value().unwrap_or(Value::Null);
+        let frame = self.frames.pop().expect("return requires active frame");
+        let restore_dir = self.frame_restore_dirs.pop().flatten();
+        if let Some(annotation) = &frame.function.return_type {
+            self.ensure_type_matches(annotation, &return_value)?;
+        }
+
+        // 中文註解：函式返回前要先把仍開啟的 upvalue 關閉，讓 closure 繼續共享最後值。
+        self.close_upvalues_from(frame.slot_offset);
+
+        let callee_slot = if frame.function.takes_self {
+            frame.slot_offset
+        } else {
+            frame.slot_offset.saturating_sub(1)
+        };
+        self.stack.truncate(callee_slot);
+
+        if let Some(dir) = restore_dir {
+            self.current_dir = dir;
+        }
+
+        if self.frames.is_empty() {
+            return Ok(return_value);
+        }
+
+        self.stack.push(return_value.clone());
+        Ok(return_value)
+    }
+
+    fn handle_runtime_error(&mut self, err: TinyLangError) -> Result<bool> {
+        let Some(frame) = self.try_stack.pop() else {
+            return Ok(false);
+        };
+
+        // 中文註解：回滾呼叫堆疊與 value stack，讓 catch block 在一致狀態下恢復執行。
+        while self.frames.len() > frame.frame_depth {
+            if let Some(unwound) = self.frames.pop() {
+                if let Some(dir) = self.frame_restore_dirs.pop().flatten() {
+                    self.current_dir = dir;
+                }
+                self.close_upvalues_from(unwound.slot_offset);
+            }
+        }
+        self.close_upvalues_from(frame.stack_depth);
+        self.stack.truncate(frame.stack_depth);
+
+        let message = string_value(&mut self.heap, err.to_string());
+        self.stack.push(message);
+
+        if let Some(current) = self.frames.last_mut() {
+            current.ip = frame.catch_ip;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn execute_import(&mut self, path: &str) -> Result<()> {
+        let candidate = self.current_dir.join(path);
+        let canonical = std::fs::canonicalize(&candidate)
+            .map_err(|_| TinyLangError::runtime(format!("Import file not found: {path}")))?;
+
+        if self.imported_files.contains(&canonical) {
+            return Ok(());
+        }
+
+        let source =
+            std::fs::read_to_string(&canonical).map_err(|err| TinyLangError::io(err.to_string()))?;
+        let program = crate::parse_source(&source)?;
+        let chunk = crate::compiler::Compiler::compile_program_with_heap(&program, self.heap.clone())?;
+        self.heap = chunk.heap.clone();
+
+        self.imported_files.insert(canonical.clone());
+        let previous_dir = self.current_dir.clone();
+        if let Some(parent) = canonical.parent() {
+            self.current_dir = parent.to_path_buf();
+        }
+
+        // 中文註解：import 腳本在同一個 VM 中跑，所以宣告的 globals 會自然留在目前環境。
+        self.structs.extend(chunk.structs.clone());
+        for (name, methods) in &chunk.methods {
+            self.methods
+                .entry(name.clone())
+                .or_default()
+                .extend(methods.clone());
+        }
+        self.push_script_frame(chunk, "<import>", Some(previous_dir));
+        Ok(())
     }
 
     fn pop_value(&mut self) -> Result<Value> {
@@ -559,6 +1097,7 @@ impl<W: Write> VM<W> {
             slot_offset,
             upvalues: Vec::new(), // 普通函式沒有 upvalue
         });
+        self.frame_restore_dirs.push(None);
         Ok(())
     }
 
@@ -597,6 +1136,7 @@ impl<W: Write> VM<W> {
             slot_offset,
             upvalues, // 傳入閉包的 upvalue 列表
         });
+        self.frame_restore_dirs.push(None);
         Ok(())
     }
 
