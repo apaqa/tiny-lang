@@ -40,6 +40,7 @@ match p.x {
 - `match` pattern matching：整數、字串、布林、識別字綁定、`_`
 - bytecode compiler、disassembler 與 VM
 - tree interpreter 保留作為 fallback 與參考實作
+- **靜態型別檢查器**：在 parse 後、執行前走訪 AST，收集所有型別錯誤（不在第一個錯誤停止）
 
 ## 內建函式
 
@@ -85,4 +86,4 @@ match p.x {
 
 ## 測試數量
 
-目前共有 **102** 個測試，涵蓋 lexer、parser、interpreter、compiler、VM、型別、struct、method、match、GC、closures、enum 與其他標準功能。
+目前共有 **126** 個測試，涵蓋 lexer、parser、interpreter、compiler、VM、型別、struct、method、match、GC、closures、enum、靜態型別檢查器與其他標準功能。

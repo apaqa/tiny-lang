@@ -16,6 +16,8 @@ pub enum ErrorKind {
     Parse,
     Runtime,
     Io,
+    /// 靜態型別檢查錯誤（在執行前由 TypeChecker 產生）
+    TypeCheck,
 }
 
 /// tiny-lang 統一錯誤。
@@ -59,6 +61,24 @@ impl TinyLangError {
         }
     }
 
+    /// 靜態型別檢查錯誤，可選附帶行列號。
+    pub fn type_check(message: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::TypeCheck,
+            message: message.into(),
+            span: None,
+        }
+    }
+
+    /// 帶行列號的靜態型別檢查錯誤。
+    pub fn type_check_at(message: impl Into<String>, span: Span) -> Self {
+        Self {
+            kind: ErrorKind::TypeCheck,
+            message: message.into(),
+            span: Some(span),
+        }
+    }
+
     pub fn with_span(mut self, span: Span) -> Self {
         self.span = Some(span);
         self
@@ -70,6 +90,7 @@ impl TinyLangError {
             ErrorKind::Parse => "Parser",
             ErrorKind::Runtime => "Runtime",
             ErrorKind::Io => "IO",
+            ErrorKind::TypeCheck => "TypeError",
         }
     }
 }
