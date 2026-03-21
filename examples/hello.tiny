@@ -1,0 +1,2 @@
+// 最小 hello world 範例。
+print("hello, tiny-lang");

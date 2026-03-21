@@ -1,0 +1,6 @@
+// import 模組示範。
+import "math_lib.tiny";
+
+print(square(6));
+print(cube(3));
+print(PI);

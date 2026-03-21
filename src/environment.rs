@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::ast::Statement;
+use crate::ast::{Statement, TypeAnnotation};
 use crate::error::{Result, TinyLangError};
 
 /// 陣列採共享可變參考，讓函式與閉包能共用同一份資料。
@@ -28,11 +28,19 @@ pub enum Value {
     Null,
 }
 
+/// 變數繫結除了值以外，也可帶可選型別標註。
+#[derive(Debug, Clone)]
+pub struct Binding {
+    pub value: Value,
+    pub type_annotation: Option<TypeAnnotation>,
+}
+
 /// 使用者定義函式或 lambda 的執行期表示。
 #[derive(Debug, Clone)]
 pub struct FunctionValue {
     pub name: Option<String>,
-    pub params: Vec<String>,
+    pub params: Vec<(String, Option<TypeAnnotation>)>,
+    pub return_type: Option<TypeAnnotation>,
     pub body: Vec<Statement>,
     pub closure: EnvRef,
 }
@@ -50,13 +58,31 @@ pub enum BuiltinFunction {
     Range,
     Keys,
     Values,
+    Abs,
+    Max,
+    Min,
+    Pow,
+    Split,
+    Join,
+    Trim,
+    Upper,
+    Lower,
+    Contains,
+    Replace,
+    Sort,
+    Reverse,
+    Map,
+    Filter,
+    Reduce,
+    Find,
+    Assert,
 }
 
 pub type EnvRef = Rc<RefCell<Environment>>;
 
 #[derive(Debug, Clone)]
 pub struct Environment {
-    values: HashMap<String, Value>,
+    values: HashMap<String, Binding>,
     parent: Option<EnvRef>,
 }
 
@@ -76,12 +102,22 @@ impl Environment {
     }
 
     pub fn define(&mut self, name: String, value: Value) {
-        self.values.insert(name, value);
+        self.define_typed(name, value, None);
+    }
+
+    pub fn define_typed(&mut self, name: String, value: Value, type_annotation: Option<TypeAnnotation>) {
+        self.values.insert(
+            name,
+            Binding {
+                value,
+                type_annotation,
+            },
+        );
     }
 
     pub fn get(&self, name: &str) -> Result<Value> {
-        if let Some(value) = self.values.get(name) {
-            return Ok(value.clone());
+        if let Some(binding) = self.values.get(name) {
+            return Ok(binding.value.clone());
         }
 
         if let Some(parent) = &self.parent {
@@ -92,13 +128,25 @@ impl Environment {
     }
 
     pub fn assign(&mut self, name: &str, value: Value) -> Result<()> {
-        if self.values.contains_key(name) {
-            self.values.insert(name.to_string(), value);
+        if let Some(binding) = self.values.get_mut(name) {
+            binding.value = value;
             return Ok(());
         }
 
         if let Some(parent) = &self.parent {
             return parent.borrow_mut().assign(name, value);
+        }
+
+        Err(TinyLangError::runtime(format!("Variable '{name}' not defined")))
+    }
+
+    pub fn get_annotation(&self, name: &str) -> Result<Option<TypeAnnotation>> {
+        if let Some(binding) = self.values.get(name) {
+            return Ok(binding.type_annotation.clone());
+        }
+
+        if let Some(parent) = &self.parent {
+            return parent.borrow().get_annotation(name);
         }
 
         Err(TinyLangError::runtime(format!("Variable '{name}' not defined")))
@@ -141,11 +189,41 @@ impl Value {
             Value::Null => "null",
         }
     }
+
+    /// 將值轉成使用者錯誤訊息使用的型別名稱。
+    pub fn type_name_for_error(&self) -> String {
+        match self {
+            Value::Int(_) => "int".into(),
+            Value::String(_) => "str".into(),
+            Value::Bool(_) => "bool".into(),
+            Value::Array(items) => {
+                let items = items.borrow();
+                if let Some(first) = items.first() {
+                    format!("[{}]", first.type_name_for_error())
+                } else {
+                    "[any]".into()
+                }
+            }
+            Value::Map(items) => {
+                let items = items.borrow();
+                if let Some(first) = items.values().next() {
+                    format!("{{{}}}", first.type_name_for_error())
+                } else {
+                    "{any}".into()
+                }
+            }
+            Value::Function(_) | Value::Builtin(_) => "function".into(),
+            Value::Null => "null".into(),
+        }
+    }
 }
 
 impl PartialEq for FunctionValue {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name && self.params == other.params && self.body == other.body
+        self.name == other.name
+            && self.params == other.params
+            && self.return_type == other.return_type
+            && self.body == other.body
     }
 }
 

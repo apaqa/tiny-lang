@@ -1,0 +1,10 @@
+// 可被 import 的小型數學模組。
+let PI: int = 3;
+
+fn square(x: int) -> int {
+    return x * x;
+}
+
+fn cube(x: int) -> int {
+    return x * x * x;
+}

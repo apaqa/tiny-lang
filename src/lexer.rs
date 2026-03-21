@@ -43,7 +43,7 @@ impl Lexer {
                 '"' => tokens.push(self.read_string()?),
                 'a'..='z' | 'A'..='Z' | '_' => tokens.push(self.read_identifier_or_keyword()),
                 '+' => tokens.push(self.single_char(Token::Plus)),
-                '-' => tokens.push(self.single_char(Token::Minus)),
+                '-' => tokens.push(self.read_minus_or_arrow()),
                 '*' => tokens.push(self.single_char(Token::Star)),
                 '/' => tokens.push(self.single_char(Token::Slash)),
                 '%' => tokens.push(self.single_char(Token::Percent)),
@@ -108,6 +108,17 @@ impl Lexer {
         let span = self.current_span();
         self.advance();
         let token = if self.match_char(expected) { two } else { one };
+        SpannedToken { token, span }
+    }
+
+    fn read_minus_or_arrow(&mut self) -> SpannedToken {
+        let span = self.current_span();
+        self.advance();
+        let token = if self.match_char('>') {
+            Token::Arrow
+        } else {
+            Token::Minus
+        };
         SpannedToken { token, span }
     }
 
@@ -232,6 +243,7 @@ impl Lexer {
             "continue" => Token::Continue,
             "try" => Token::Try,
             "catch" => Token::Catch,
+            "import" => Token::Import,
             "print" => Token::Print,
             "true" => Token::BoolLit(true),
             "false" => Token::BoolLit(false),

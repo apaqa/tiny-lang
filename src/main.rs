@@ -1,17 +1,16 @@
-//! tiny-lang 的執行入口。
+//! tiny-lang 命令列入口。
 //!
 //! `cargo run`
 //! 會進入 REPL。
-//!
-//! `cargo run -- examples\\demo.tiny`
-//! 會直接執行檔案。
+//! `cargo run -- examples\\showcase.tiny`
+//! 會執行指定檔案。
 
 use std::env;
-use std::fs;
 use std::io::{self, Write};
 
 use tiny_lang::error::{Result, TinyLangError};
 use tiny_lang::interpreter::Interpreter;
+use tiny_lang::run_file;
 
 fn main() {
     if let Err(err) = run() {
@@ -28,9 +27,7 @@ fn run() -> Result<()> {
     }
 
     if let Some(path) = args.get(1) {
-        let source = fs::read_to_string(path)?;
-        let mut interpreter = Interpreter::new();
-        interpreter.interpret_source(&source)?;
+        run_file(path)?;
     } else {
         repl()?;
     }

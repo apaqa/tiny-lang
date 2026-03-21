@@ -1,13 +1,15 @@
 //! Tree-walking interpreter。
 //!
-//! Phase 3 在這裡加入 for、break/continue、Map、閉包與 try/catch。
+//! Phase 4 在這裡加入型別檢查、import 與擴充標準庫。
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Stdin, Stdout, Write};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use crate::ast::{BinaryOperator, Expr, Program, Statement, UnaryOperator};
+use crate::ast::{BinaryOperator, Expr, Program, Statement, TypeAnnotation, UnaryOperator};
 use crate::environment::{BuiltinFunction, EnvRef, Environment, FunctionValue, Value};
 use crate::error::{Result, TinyLangError};
 
@@ -37,6 +39,8 @@ pub struct Interpreter<W: Write, R: BufRead> {
     env: EnvRef,
     output: W,
     input: R,
+    current_dir: PathBuf,
+    imported_files: HashSet<PathBuf>,
 }
 
 impl Interpreter<Stdout, BufReader<Stdin>> {
@@ -55,7 +59,13 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
     pub fn with_io(output: W, input: R) -> Self {
         let env = Environment::new();
         install_builtins(&env);
-        Self { env, output, input }
+        Self {
+            env,
+            output,
+            input,
+            current_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            imported_files: HashSet::new(),
+        }
     }
 
     pub fn interpret(&mut self, program: &Program) -> Result<()> {
@@ -79,6 +89,18 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         self.interpret(&program)
     }
 
+    pub fn interpret_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let source = fs::read_to_string(path).map_err(|err| TinyLangError::io(err.to_string()))?;
+        let previous_dir = self.current_dir.clone();
+        if let Some(parent) = path.parent() {
+            self.current_dir = parent.to_path_buf();
+        }
+        let result = self.interpret_source(&source);
+        self.current_dir = previous_dir;
+        result
+    }
+
     fn execute_block(&mut self, statements: &[Statement], env: EnvRef) -> RuntimeResult<Value> {
         let previous = self.env.clone();
         self.env = env;
@@ -96,13 +118,26 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
 
     fn execute_statement(&mut self, statement: &Statement) -> RuntimeResult<Value> {
         match statement {
-            Statement::LetDecl { name, value } => {
+            Statement::Import { path } => self.execute_import(path),
+            Statement::LetDecl {
+                name,
+                type_annotation,
+                value,
+            } => {
                 let value = self.evaluate_expr(value)?;
-                self.env.borrow_mut().define(name.clone(), value);
+                if let Some(annotation) = type_annotation {
+                    self.ensure_type_matches(annotation, &value)?;
+                }
+                self.env
+                    .borrow_mut()
+                    .define_typed(name.clone(), value, type_annotation.clone());
                 Ok(Value::Null)
             }
             Statement::Assignment { name, value } => {
                 let value = self.evaluate_expr(value)?;
+                if let Some(annotation) = self.env.borrow().get_annotation(name)? {
+                    self.ensure_type_matches(&annotation, &value)?;
+                }
                 self.env.borrow_mut().assign(name, value)?;
                 Ok(Value::Null)
             }
@@ -112,10 +147,16 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 let value = self.evaluate_expr(value)?;
                 self.assign_index(target_value, index_value, value)
             }
-            Statement::FnDecl { name, params, body } => {
+            Statement::FnDecl {
+                name,
+                params,
+                return_type,
+                body,
+            } => {
                 let function = Value::Function(FunctionValue {
                     name: Some(name.clone()),
                     params: params.clone(),
+                    return_type: return_type.clone(),
                     body: body.clone(),
                     closure: self.env.clone(),
                 });
@@ -198,6 +239,36 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         }
     }
 
+    fn execute_import(&mut self, path: &str) -> RuntimeResult<Value> {
+        let candidate = self.current_dir.join(path);
+        let canonical = fs::canonicalize(&candidate).map_err(|_| {
+            Signal::Error(TinyLangError::runtime(format!("Import file not found: {path}")))
+        })?;
+
+        if self.imported_files.contains(&canonical) {
+            return Ok(Value::Null);
+        }
+
+        let source = fs::read_to_string(&canonical)
+            .map_err(|err| Signal::Error(TinyLangError::io(err.to_string())))?;
+        let program = crate::parse_source(&source).map_err(Signal::Error)?;
+
+        self.imported_files.insert(canonical.clone());
+        let previous_dir = self.current_dir.clone();
+        if let Some(parent) = canonical.parent() {
+            self.current_dir = parent.to_path_buf();
+        }
+
+        let result = self.execute_block(&program, self.env.clone());
+        self.current_dir = previous_dir;
+
+        if result.is_err() {
+            self.imported_files.remove(&canonical);
+        }
+
+        result
+    }
+
     fn evaluate_expr(&mut self, expr: &Expr) -> RuntimeResult<Value> {
         match expr {
             Expr::IntLit(value) => Ok(Value::Int(*value)),
@@ -260,7 +331,8 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             }
             Expr::Lambda { params, body } => Ok(Value::Function(FunctionValue {
                 name: None,
-                params: params.clone(),
+                params: params.iter().map(|name| (name.clone(), None)).collect(),
+                return_type: None,
                 body: body.clone(),
                 closure: self.env.clone(),
             })),
@@ -273,7 +345,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             Value::Builtin(builtin) => self.call_builtin(builtin, args),
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "value of type {} is not callable",
-                other.type_name()
+                other.type_name_for_error()
             )))),
         }
     }
@@ -288,17 +360,39 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             ))));
         }
 
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            values.push(self.evaluate_expr(arg)?);
+        }
+        self.call_function_with_values(function, values)
+    }
+
+    fn call_function_with_values(
+        &mut self,
+        function: &FunctionValue,
+        values: Vec<Value>,
+    ) -> RuntimeResult<Value> {
         let call_env = Environment::enclosed(function.closure.clone());
-        for (param, arg_expr) in function.params.iter().zip(args.iter()) {
-            let value = self.evaluate_expr(arg_expr)?;
-            call_env.borrow_mut().define(param.clone(), value);
+        for ((param, annotation), value) in function.params.iter().zip(values.into_iter()) {
+            if let Some(annotation) = annotation {
+                self.ensure_type_matches(annotation, &value)?;
+            }
+            call_env
+                .borrow_mut()
+                .define_typed(param.clone(), value, annotation.clone());
         }
 
-        match self.execute_block(&function.body, call_env) {
-            Ok(value) => Ok(value),
-            Err(Signal::Control(ControlFlow::Return(value))) => Ok(value),
-            Err(err) => Err(err),
+        let result = match self.execute_block(&function.body, call_env) {
+            Ok(value) => value,
+            Err(Signal::Control(ControlFlow::Return(value))) => value,
+            Err(err) => return Err(err),
+        };
+
+        if let Some(annotation) = &function.return_type {
+            self.ensure_type_matches(annotation, &result)?;
         }
+
+        Ok(result)
     }
 
     fn call_builtin(&mut self, builtin: BuiltinFunction, args: &[Expr]) -> RuntimeResult<Value> {
@@ -311,7 +405,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                     Value::Map(items) => Ok(Value::Int(items.borrow().len() as i64)),
                     other => Err(Signal::Error(TinyLangError::runtime(format!(
                         "Function 'len' expects Array, String, or Map, got {}",
-                        other.type_name()
+                        other.type_name_for_error()
                     )))),
                 }
             }
@@ -324,7 +418,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                     }
                     other => Err(Signal::Error(TinyLangError::runtime(format!(
                         "Function 'push' expects Array as first argument, got {}",
-                        other.type_name()
+                        other.type_name_for_error()
                     )))),
                 }
             }
@@ -334,7 +428,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                     Value::Array(items) => Ok(items.borrow_mut().pop().unwrap_or(Value::Null)),
                     other => Err(Signal::Error(TinyLangError::runtime(format!(
                         "Function 'pop' expects Array, got {}",
-                        other.type_name()
+                        other.type_name_for_error()
                     )))),
                 }
             }
@@ -347,7 +441,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 self.cast_to_int(&values[0])
             }
             BuiltinFunction::TypeOf => {
-                let values = self.eval_args("type_of", 1, args)?;
+                let values = self.eval_args("typeof", 1, args)?;
                 Ok(Value::String(values[0].type_name_for_builtin().to_string()))
             }
             BuiltinFunction::Input => {
@@ -357,7 +451,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                     other => {
                         return Err(Signal::Error(TinyLangError::runtime(format!(
                             "Function 'input' expects String prompt, got {}",
-                            other.type_name()
+                            other.type_name_for_error()
                         ))))
                     }
                 };
@@ -396,7 +490,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                     }
                     other => Err(Signal::Error(TinyLangError::runtime(format!(
                         "Function 'keys' expects Map, got {}",
-                        other.type_name()
+                        other.type_name_for_error()
                     )))),
                 }
             }
@@ -416,8 +510,176 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                     }
                     other => Err(Signal::Error(TinyLangError::runtime(format!(
                         "Function 'values' expects Map, got {}",
-                        other.type_name()
+                        other.type_name_for_error()
                     )))),
+                }
+            }
+            BuiltinFunction::Abs => {
+                let values = self.eval_args("abs", 1, args)?;
+                Ok(Value::Int(self.expect_int(values[0].clone(), "abs argument")?.abs()))
+            }
+            BuiltinFunction::Max => {
+                let values = self.eval_args("max", 2, args)?;
+                let a = self.expect_int(values[0].clone(), "max first argument")?;
+                let b = self.expect_int(values[1].clone(), "max second argument")?;
+                Ok(Value::Int(a.max(b)))
+            }
+            BuiltinFunction::Min => {
+                let values = self.eval_args("min", 2, args)?;
+                let a = self.expect_int(values[0].clone(), "min first argument")?;
+                let b = self.expect_int(values[1].clone(), "min second argument")?;
+                Ok(Value::Int(a.min(b)))
+            }
+            BuiltinFunction::Pow => {
+                let values = self.eval_args("pow", 2, args)?;
+                let base = self.expect_int(values[0].clone(), "pow base")?;
+                let exp = self.expect_int(values[1].clone(), "pow exponent")?;
+                if exp < 0 {
+                    return Err(Signal::Error(TinyLangError::runtime(
+                        "pow exponent must be non-negative",
+                    )));
+                }
+                Ok(Value::Int(base.pow(exp as u32)))
+            }
+            BuiltinFunction::Split => {
+                let values = self.eval_args("split", 2, args)?;
+                let text = self.expect_string(values[0].clone(), "split first argument")?;
+                let sep = self.expect_string(values[1].clone(), "split second argument")?;
+                let parts = if sep.is_empty() {
+                    text.chars().map(|ch| Value::String(ch.to_string())).collect()
+                } else {
+                    text.split(&sep).map(|part| Value::String(part.to_string())).collect()
+                };
+                Ok(Value::Array(Rc::new(RefCell::new(parts))))
+            }
+            BuiltinFunction::Join => {
+                let values = self.eval_args("join", 2, args)?;
+                let items = self.expect_array(values[0].clone(), "join first argument")?;
+                let sep = self.expect_string(values[1].clone(), "join second argument")?;
+                let rendered = items.into_iter().map(|item| item.to_string()).collect::<Vec<_>>();
+                Ok(Value::String(rendered.join(&sep)))
+            }
+            BuiltinFunction::Trim => {
+                let values = self.eval_args("trim", 1, args)?;
+                let text = self.expect_string(values[0].clone(), "trim argument")?;
+                Ok(Value::String(text.trim().to_string()))
+            }
+            BuiltinFunction::Upper => {
+                let values = self.eval_args("upper", 1, args)?;
+                let text = self.expect_string(values[0].clone(), "upper argument")?;
+                Ok(Value::String(text.to_uppercase()))
+            }
+            BuiltinFunction::Lower => {
+                let values = self.eval_args("lower", 1, args)?;
+                let text = self.expect_string(values[0].clone(), "lower argument")?;
+                Ok(Value::String(text.to_lowercase()))
+            }
+            BuiltinFunction::Contains => {
+                let values = self.eval_args("contains", 2, args)?;
+                let text = self.expect_string(values[0].clone(), "contains first argument")?;
+                let needle = self.expect_string(values[1].clone(), "contains second argument")?;
+                Ok(Value::Bool(text.contains(&needle)))
+            }
+            BuiltinFunction::Replace => {
+                let values = self.eval_args("replace", 3, args)?;
+                let text = self.expect_string(values[0].clone(), "replace first argument")?;
+                let old = self.expect_string(values[1].clone(), "replace second argument")?;
+                let new = self.expect_string(values[2].clone(), "replace third argument")?;
+                Ok(Value::String(text.replace(&old, &new)))
+            }
+            BuiltinFunction::Sort => {
+                let values = self.eval_args("sort", 1, args)?;
+                match &values[0] {
+                    Value::Array(items) => {
+                        let mut items_ref = items.borrow_mut();
+                        if items_ref.iter().all(|item| matches!(item, Value::Int(_))) {
+                            items_ref.sort_by_key(|item| match item {
+                                Value::Int(value) => *value,
+                                _ => 0,
+                            });
+                        } else if items_ref.iter().all(|item| matches!(item, Value::String(_))) {
+                            items_ref.sort_by_key(|item| match item {
+                                Value::String(value) => value.clone(),
+                                _ => String::new(),
+                            });
+                        } else {
+                            return Err(Signal::Error(TinyLangError::runtime(
+                                "sort only supports arrays of int or str",
+                            )));
+                        }
+                        Ok(values[0].clone())
+                    }
+                    other => Err(Signal::Error(TinyLangError::runtime(format!(
+                        "Function 'sort' expects Array, got {}",
+                        other.type_name_for_error()
+                    )))),
+                }
+            }
+            BuiltinFunction::Reverse => {
+                let values = self.eval_args("reverse", 1, args)?;
+                match &values[0] {
+                    Value::Array(items) => {
+                        items.borrow_mut().reverse();
+                        Ok(values[0].clone())
+                    }
+                    other => Err(Signal::Error(TinyLangError::runtime(format!(
+                        "Function 'reverse' expects Array, got {}",
+                        other.type_name_for_error()
+                    )))),
+                }
+            }
+            BuiltinFunction::Map => {
+                let values = self.eval_args("map", 2, args)?;
+                let items = self.expect_array(values[0].clone(), "map first argument")?;
+                let callback = self.expect_function_value(values[1].clone(), "map second argument")?;
+                let mut result = Vec::new();
+                for item in items {
+                    result.push(self.call_function_with_values(&callback, vec![item])?);
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(result))))
+            }
+            BuiltinFunction::Filter => {
+                let values = self.eval_args("filter", 2, args)?;
+                let items = self.expect_array(values[0].clone(), "filter first argument")?;
+                let callback = self.expect_function_value(values[1].clone(), "filter second argument")?;
+                let mut result = Vec::new();
+                for item in items {
+                    let keep = self.call_function_with_values(&callback, vec![item.clone()])?;
+                    if keep.is_truthy() {
+                        result.push(item);
+                    }
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(result))))
+            }
+            BuiltinFunction::Reduce => {
+                let values = self.eval_args("reduce", 3, args)?;
+                let items = self.expect_array(values[0].clone(), "reduce first argument")?;
+                let callback = self.expect_function_value(values[1].clone(), "reduce second argument")?;
+                let mut acc = values[2].clone();
+                for item in items {
+                    acc = self.call_function_with_values(&callback, vec![acc, item])?;
+                }
+                Ok(acc)
+            }
+            BuiltinFunction::Find => {
+                let values = self.eval_args("find", 2, args)?;
+                let items = self.expect_array(values[0].clone(), "find first argument")?;
+                let callback = self.expect_function_value(values[1].clone(), "find second argument")?;
+                for item in items {
+                    let matched = self.call_function_with_values(&callback, vec![item.clone()])?;
+                    if matched.is_truthy() {
+                        return Ok(item);
+                    }
+                }
+                Ok(Value::Null)
+            }
+            BuiltinFunction::Assert => {
+                let values = self.eval_args("assert", 2, args)?;
+                let message = self.expect_string(values[1].clone(), "assert message")?;
+                if values[0].is_truthy() {
+                    Ok(Value::Null)
+                } else {
+                    Err(Signal::Error(TinyLangError::runtime(message)))
                 }
             }
         }
@@ -443,7 +705,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             Value::Array(items) => Ok(items.borrow().clone()),
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "for loop expects Array iterable, got {}",
-                other.type_name()
+                other.type_name_for_error()
             )))),
         }
     }
@@ -461,7 +723,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 )))),
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "Cannot convert {} to Int",
-                other.type_name()
+                other.type_name_for_error()
             )))),
         }
     }
@@ -488,7 +750,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             }
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "Index assignment expects Array or Map, got {}",
-                other.type_name()
+                other.type_name_for_error()
             )))),
         }
     }
@@ -523,8 +785,37 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             }
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "Index access expects Array, String, or Map, got {}",
-                other.type_name()
+                other.type_name_for_error()
             )))),
+        }
+    }
+
+    fn ensure_type_matches(&self, annotation: &TypeAnnotation, value: &Value) -> RuntimeResult<()> {
+        if self.value_matches_type(annotation, value) {
+            Ok(())
+        } else {
+            Err(Signal::Error(TinyLangError::runtime(format!(
+                "Expected {}, got {}",
+                annotation.display_name(),
+                value.type_name_for_error()
+            ))))
+        }
+    }
+
+    fn value_matches_type(&self, annotation: &TypeAnnotation, value: &Value) -> bool {
+        match annotation {
+            TypeAnnotation::Any => true,
+            TypeAnnotation::Int => matches!(value, Value::Int(_)),
+            TypeAnnotation::Str => matches!(value, Value::String(_)),
+            TypeAnnotation::Bool => matches!(value, Value::Bool(_)),
+            TypeAnnotation::ArrayOf(inner) => match value {
+                Value::Array(items) => items.borrow().iter().all(|item| self.value_matches_type(inner, item)),
+                _ => false,
+            },
+            TypeAnnotation::MapOf(inner) => match value {
+                Value::Map(items) => items.borrow().values().all(|item| self.value_matches_type(inner, item)),
+                _ => false,
+            },
         }
     }
 
@@ -537,7 +828,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             )))),
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "Index must be Int, got {}",
-                other.type_name()
+                other.type_name_for_error()
             )))),
         }
     }
@@ -547,7 +838,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             Value::String(key) => Ok(key),
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "Map key must be String, got {}",
-                other.type_name()
+                other.type_name_for_error()
             )))),
         }
     }
@@ -557,7 +848,37 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             Value::Int(number) => Ok(number),
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "{label} must be Int, got {}",
-                other.type_name()
+                other.type_name_for_error()
+            )))),
+        }
+    }
+
+    fn expect_string(&self, value: Value, label: &str) -> RuntimeResult<String> {
+        match value {
+            Value::String(text) => Ok(text),
+            other => Err(Signal::Error(TinyLangError::runtime(format!(
+                "{label} must be Str, got {}",
+                other.type_name_for_error()
+            )))),
+        }
+    }
+
+    fn expect_array(&self, value: Value, label: &str) -> RuntimeResult<Vec<Value>> {
+        match value {
+            Value::Array(items) => Ok(items.borrow().clone()),
+            other => Err(Signal::Error(TinyLangError::runtime(format!(
+                "{label} must be Array, got {}",
+                other.type_name_for_error()
+            )))),
+        }
+    }
+
+    fn expect_function_value(&self, value: Value, label: &str) -> RuntimeResult<FunctionValue> {
+        match value {
+            Value::Function(function) => Ok(function),
+            other => Err(Signal::Error(TinyLangError::runtime(format!(
+                "{label} must be function, got {}",
+                other.type_name_for_error()
             )))),
         }
     }
@@ -568,7 +889,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 Value::Int(v) => Ok(Value::Int(-v)),
                 other => Err(Signal::Error(TinyLangError::runtime(format!(
                     "Cannot negate {}",
-                    other.type_name()
+                    other.type_name_for_error()
                 )))),
             },
             UnaryOperator::Not => Ok(Value::Bool(!value.is_truthy())),
@@ -648,8 +969,27 @@ fn install_builtins(env: &EnvRef) {
     env.define("str".into(), Value::Builtin(BuiltinFunction::Str));
     env.define("int".into(), Value::Builtin(BuiltinFunction::Int));
     env.define("type_of".into(), Value::Builtin(BuiltinFunction::TypeOf));
+    env.define("typeof".into(), Value::Builtin(BuiltinFunction::TypeOf));
     env.define("input".into(), Value::Builtin(BuiltinFunction::Input));
     env.define("range".into(), Value::Builtin(BuiltinFunction::Range));
     env.define("keys".into(), Value::Builtin(BuiltinFunction::Keys));
     env.define("values".into(), Value::Builtin(BuiltinFunction::Values));
+    env.define("abs".into(), Value::Builtin(BuiltinFunction::Abs));
+    env.define("max".into(), Value::Builtin(BuiltinFunction::Max));
+    env.define("min".into(), Value::Builtin(BuiltinFunction::Min));
+    env.define("pow".into(), Value::Builtin(BuiltinFunction::Pow));
+    env.define("split".into(), Value::Builtin(BuiltinFunction::Split));
+    env.define("join".into(), Value::Builtin(BuiltinFunction::Join));
+    env.define("trim".into(), Value::Builtin(BuiltinFunction::Trim));
+    env.define("upper".into(), Value::Builtin(BuiltinFunction::Upper));
+    env.define("lower".into(), Value::Builtin(BuiltinFunction::Lower));
+    env.define("contains".into(), Value::Builtin(BuiltinFunction::Contains));
+    env.define("replace".into(), Value::Builtin(BuiltinFunction::Replace));
+    env.define("sort".into(), Value::Builtin(BuiltinFunction::Sort));
+    env.define("reverse".into(), Value::Builtin(BuiltinFunction::Reverse));
+    env.define("map".into(), Value::Builtin(BuiltinFunction::Map));
+    env.define("filter".into(), Value::Builtin(BuiltinFunction::Filter));
+    env.define("reduce".into(), Value::Builtin(BuiltinFunction::Reduce));
+    env.define("find".into(), Value::Builtin(BuiltinFunction::Find));
+    env.define("assert".into(), Value::Builtin(BuiltinFunction::Assert));
 }

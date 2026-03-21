@@ -1,0 +1,33 @@
+// 展示 tiny-lang 目前支援的大部分功能。
+import "math_lib.tiny";
+
+let nums: [int] = range(0, 6);
+let doubled = map(nums, |x| x * 2);
+let evens = filter(doubled, |x| x % 4 == 0);
+let total = reduce(evens, |acc, x| acc + x, 0);
+
+print(nums);
+print(doubled);
+print(evens);
+print(total);
+
+let user: {str} = {"name": "Alice", "city": "Taipei"};
+print(keys(user));
+print(values(user));
+
+for n in nums {
+    if n == 2 {
+        continue;
+    }
+    if n == 5 {
+        break;
+    }
+    print(square(n));
+}
+
+try {
+    assert(contains(lower("Tiny-Lang"), "lang"), "missing lang");
+    assert(false, "demo error");
+} catch e {
+    print(e);
+}

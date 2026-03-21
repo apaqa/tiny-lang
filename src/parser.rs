@@ -1,9 +1,9 @@
 //! Parser 實作。
 //!
 //! 這裡使用遞迴下降 parser，將 token 串轉成 AST。
-//! Phase 3 追加了 for、map、lambda、try/catch 與 break/continue。
+//! Phase 4 追加了型別標註與 import。
 
-use crate::ast::{BinaryOperator, Expr, Program, Statement, UnaryOperator};
+use crate::ast::{BinaryOperator, Expr, Program, Statement, TypeAnnotation, UnaryOperator};
 use crate::error::{Result, TinyLangError};
 use crate::token::{SpannedToken, Token};
 
@@ -27,6 +27,7 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<Statement> {
         match &self.peek().token {
+            Token::Import => self.parse_import_stmt(),
             Token::Let => self.parse_let_decl(),
             Token::Fn if matches!(self.peek_next_token(), Some(Token::Ident(_))) => self.parse_fn_decl(),
             Token::Return => self.parse_return_stmt(),
@@ -43,13 +44,32 @@ impl Parser {
         }
     }
 
+    fn parse_import_stmt(&mut self) -> Result<Statement> {
+        self.expect_token(Token::Import)?;
+        let path_token = self.advance().clone();
+        let Token::StringLit(path) = path_token.token else {
+            return Err(TinyLangError::parse("import expects a string path", path_token.span));
+        };
+        self.expect_token(Token::Semicolon)?;
+        Ok(Statement::Import { path })
+    }
+
     fn parse_let_decl(&mut self) -> Result<Statement> {
         self.expect_token(Token::Let)?;
         let name = self.consume_ident()?;
+        let type_annotation = if self.match_token(&Token::Colon) {
+            Some(self.parse_type_annotation()?)
+        } else {
+            None
+        };
         self.expect_token(Token::Assign)?;
         let value = self.parse_expression()?;
         self.expect_token(Token::Semicolon)?;
-        Ok(Statement::LetDecl { name, value })
+        Ok(Statement::LetDecl {
+            name,
+            type_annotation,
+            value,
+        })
     }
 
     fn parse_assignment(&mut self) -> Result<Statement> {
@@ -87,9 +107,19 @@ impl Parser {
     fn parse_fn_decl(&mut self) -> Result<Statement> {
         self.expect_token(Token::Fn)?;
         let name = self.consume_ident()?;
-        let params = self.parse_parameter_list()?;
+        let params = self.parse_typed_parameter_list()?;
+        let return_type = if self.match_token(&Token::Arrow) {
+            Some(self.parse_type_annotation()?)
+        } else {
+            None
+        };
         let body = self.parse_block()?;
-        Ok(Statement::FnDecl { name, params, body })
+        Ok(Statement::FnDecl {
+            name,
+            params,
+            return_type,
+            body,
+        })
     }
 
     fn parse_return_stmt(&mut self) -> Result<Statement> {
@@ -186,12 +216,18 @@ impl Parser {
         Ok(statements)
     }
 
-    fn parse_parameter_list(&mut self) -> Result<Vec<String>> {
+    fn parse_typed_parameter_list(&mut self) -> Result<Vec<(String, Option<TypeAnnotation>)>> {
         self.expect_token(Token::LParen)?;
         let mut params = Vec::new();
         if !self.check(&Token::RParen) {
             loop {
-                params.push(self.consume_ident()?);
+                let name = self.consume_ident()?;
+                let annotation = if self.match_token(&Token::Colon) {
+                    Some(self.parse_type_annotation()?)
+                } else {
+                    None
+                };
+                params.push((name, annotation));
                 if !self.match_token(&Token::Comma) {
                     break;
                 }
@@ -214,6 +250,36 @@ impl Parser {
         }
         self.expect_token(Token::Pipe)?;
         Ok(params)
+    }
+
+    fn parse_type_annotation(&mut self) -> Result<TypeAnnotation> {
+        let token = self.advance().clone();
+        match token.token {
+            Token::Ident(name) => match name.as_str() {
+                "int" => Ok(TypeAnnotation::Int),
+                "str" => Ok(TypeAnnotation::Str),
+                "bool" => Ok(TypeAnnotation::Bool),
+                "any" => Ok(TypeAnnotation::Any),
+                other => Err(TinyLangError::parse(
+                    format!("unknown type annotation '{other}'"),
+                    token.span,
+                )),
+            },
+            Token::LBracket => {
+                let inner = self.parse_type_annotation()?;
+                self.expect_token(Token::RBracket)?;
+                Ok(TypeAnnotation::ArrayOf(Box::new(inner)))
+            }
+            Token::LBrace => {
+                let inner = self.parse_type_annotation()?;
+                self.expect_token(Token::RBrace)?;
+                Ok(TypeAnnotation::MapOf(Box::new(inner)))
+            }
+            other => Err(TinyLangError::parse(
+                format!("unexpected token in type annotation: {other:?}"),
+                token.span,
+            )),
+        }
     }
 
     fn parse_expression(&mut self) -> Result<Expr> {
@@ -430,7 +496,17 @@ impl Parser {
 
     fn parse_fn_lambda(&mut self) -> Result<Expr> {
         self.expect_token(Token::Fn)?;
-        let params = self.parse_parameter_list()?;
+        self.expect_token(Token::LParen)?;
+        let mut params = Vec::new();
+        if !self.check(&Token::RParen) {
+            loop {
+                params.push(self.consume_ident()?);
+                if !self.match_token(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect_token(Token::RParen)?;
         let body = self.parse_block()?;
         Ok(Expr::Lambda { params, body })
     }

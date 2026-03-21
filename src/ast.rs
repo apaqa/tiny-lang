@@ -6,15 +6,46 @@
 /// 整份程式就是 statement 的列表。
 pub type Program = Vec<Statement>;
 
+/// 可用於可選型別標註的型別節點。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeAnnotation {
+    Int,
+    Str,
+    Bool,
+    ArrayOf(Box<TypeAnnotation>),
+    MapOf(Box<TypeAnnotation>),
+    Any,
+}
+
+impl TypeAnnotation {
+    /// 產生使用者可讀的型別名稱。
+    pub fn display_name(&self) -> String {
+        match self {
+            TypeAnnotation::Int => "int".into(),
+            TypeAnnotation::Str => "str".into(),
+            TypeAnnotation::Bool => "bool".into(),
+            TypeAnnotation::ArrayOf(inner) => format!("[{}]", inner.display_name()),
+            TypeAnnotation::MapOf(inner) => format!("{{{}}}", inner.display_name()),
+            TypeAnnotation::Any => "any".into(),
+        }
+    }
+}
+
 /// 可執行的敘述節點。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    LetDecl { name: String, value: Expr },
+    Import { path: String },
+    LetDecl {
+        name: String,
+        type_annotation: Option<TypeAnnotation>,
+        value: Expr,
+    },
     Assignment { name: String, value: Expr },
     IndexAssignment { target: Expr, index: Expr, value: Expr },
     FnDecl {
         name: String,
-        params: Vec<String>,
+        params: Vec<(String, Option<TypeAnnotation>)>,
+        return_type: Option<TypeAnnotation>,
         body: Vec<Statement>,
     },
     Return(Expr),

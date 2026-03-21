@@ -102,3 +102,14 @@ fn tokenize_phase3_keywords_and_symbols() {
     assert!(tokens.contains(&Token::Colon));
     assert!(tokens.contains(&Token::Pipe));
 }
+
+#[test]
+fn tokenize_import_and_arrow() {
+    let source = r#"import "math.tiny"; fn add(a: int) -> int { return a; }"#;
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize().unwrap();
+
+    assert!(tokens.contains(&Token::Import));
+    assert!(tokens.contains(&Token::Arrow));
+    assert!(tokens.contains(&Token::Colon));
+}

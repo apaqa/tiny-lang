@@ -143,3 +143,37 @@ fn parse_phase3_statements_and_expressions() {
     };
     assert!(matches!(value, Expr::Lambda { .. }));
 }
+
+#[test]
+fn parse_type_annotations_and_import() {
+    let source = r#"
+        import "examples/math_lib.tiny";
+        let x: int = 10;
+        let arr: [int] = [1, 2, 3];
+        fn add(a: int, b: int) -> int { return a + b; }
+    "#;
+
+    let program = parse_source(source).unwrap();
+
+    assert!(matches!(program[0], Statement::Import { .. }));
+
+    let Statement::LetDecl {
+        type_annotation: Some(_),
+        ..
+    } = &program[1]
+    else {
+        panic!("expected typed let declaration");
+    };
+
+    let Statement::FnDecl {
+        params,
+        return_type: Some(_),
+        ..
+    } = &program[3]
+    else {
+        panic!("expected typed function declaration");
+    };
+
+    assert_eq!(params.len(), 2);
+    assert!(params.iter().all(|(_, ty)| ty.is_some()));
+}

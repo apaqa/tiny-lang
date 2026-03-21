@@ -1,0 +1,22 @@
+// 使用函式與 while 計算費波那契數列。
+fn fib(n: int) -> int {
+    if n <= 1 {
+        return n;
+    }
+
+    let a: int = 0;
+    let b: int = 1;
+    let i: int = 2;
+    let current: int = 1;
+
+    while i <= n {
+        current = a + b;
+        a = b;
+        b = current;
+        i = i + 1;
+    }
+
+    return current;
+}
+
+print(fib(10));
