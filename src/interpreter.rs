@@ -1143,6 +1143,17 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                     method,
                 }))
             }
+            // enum variant 也支援欄位存取（例如 v.field_name）
+            Value::EnumVariant(reference) => {
+                let field_value = self.heap.with_enum_variant(&reference, |ev| ev.fields.get(field).cloned());
+                field_value.ok_or_else(|| {
+                    let variant_name = self.heap.get_enum_variant(&reference).variant_name.clone();
+                    Signal::Error(TinyLangError::runtime(format!(
+                        "Enum variant '{}' has no field '{}'",
+                        variant_name, field
+                    )))
+                })
+            }
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "Field access expects struct instance, got {}",
                 other.type_name_for_error()

@@ -286,7 +286,6 @@ impl Compiler {
                     self.emit(OpCode::SetGlobal(name.clone()));
                 } else {
                     self.add_local(name.clone());
-                    local.captured = true;
                 }
                 Ok(())
             }
@@ -472,23 +471,12 @@ impl Compiler {
                 self.emit(OpCode::MakeEnumVariant(enum_name.clone(), variant.clone(), field_names));
             }
         }
-        if !function.capture_sources.is_empty() {
-            self.emit(OpCode::MakeClosure(const_idx));
-        }
-        if !function.capture_sources.is_empty() {
-            self.emit(OpCode::MakeClosure(const_idx));
-        }
         Ok(())
     }
 
     /// 編譯 lambda 表達式，分析捕獲的外部 local 變數，生成 upvalue。
     fn compile_lambda(&mut self, params: &[String], body: &[Statement]) -> Result<()> {
         // 收集 lambda 體中所有引用的識別符
-        // 中文註解：lambda 需要同時分析 local 與外層 upvalue，才能正確支援巢狀 closure。
-        let all_refs = collect_body_idents(body);
-
-        // 排除 lambda 自身的參數（它們是 bound 的）
-    fn compile_lambda(&mut self, params: &[String], body: &[Statement]) -> Result<()> {
         let all_refs = collect_body_idents(body);
         let param_set: HashSet<&str> = params.iter().map(|p| p.as_str()).collect();
 
@@ -506,9 +494,7 @@ impl Compiler {
             })
             .collect();
 
-        // 按 slot 排序確保一致的順序
-        // 中文註解：用固定順序產生 capture metadata，避免測試因集合順序飄動。
-        captures.sort_by(|left, right| match (&left.1, &right.1) {
+        // 按 slot 排序確保一致的順序，避免測試因集合順序飄動
         captures.sort_by(|left, right| match (&left.1, &right.1) {
             (CaptureSource::Local(a), CaptureSource::Local(b)) => a.cmp(b).then(left.0.cmp(&right.0)),
             (CaptureSource::Upvalue(a), CaptureSource::Upvalue(b)) => {
@@ -528,19 +514,15 @@ impl Compiler {
             if let CaptureSource::Local(slot) = source {
                 if let Some(local) = self.locals.get_mut(*slot) {
                     local.captured = true;
-                    // 中文註解：被 closure 捕獲的 local 在離開 scope 時不能直接丟掉。
-                    local.captured = true;
                 }
             }
         }
 
         // 建立 lambda 的參數列表（lambda 沒有型別註記）
         let param_pairs: Vec<(String, Option<TypeAnnotation>)> =
-        let param_pairs: Vec<(String, Option<TypeAnnotation>)> =
             params.iter().map(|p| (p.clone(), None)).collect();
 
         // 編譯閉包函式（使用帶 upvalue_names 的內部 compiler）
-        let function = self.compile_closure_function(
         let function = self.compile_closure_function(
             None,
             param_pairs,
@@ -554,16 +536,10 @@ impl Compiler {
         let const_idx = self.push_constant(Value::CompiledFunction(function.clone()));
 
         if function.capture_sources.is_empty() {
-            self.emit(OpCode::Constant(const_idx));
             // 無捕獲變數：直接作為普通函式常數使用（不需要 Closure 包裝）
             self.emit(OpCode::Constant(const_idx));
         } else {
-            // 有捕獲變數：先推入各捕獲值，再發出 MakeClosure
-            // VM 的 MakeClosure 會從 stack 取出這些值建立 Closure 物件
-            // 中文註解：MakeClosure 會依照 capture_sources 在 VM 端抓 shared cell。
-            self.emit(OpCode::MakeClosure(const_idx));
-        }
-        if !function.capture_sources.is_empty() {
+            // 有捕獲變數：發出 MakeClosure，VM 端依照 capture_sources 建立 Closure 物件
             self.emit(OpCode::MakeClosure(const_idx));
         }
 
@@ -571,7 +547,6 @@ impl Compiler {
     }
 
     /// 編譯帶有 upvalue 支援的閉包函式。
-    fn compile_closure_function(
     fn compile_closure_function(
         &mut self,
         name: Option<String>,
@@ -598,7 +573,6 @@ impl Compiler {
         }
 
         // 確保函式有 return（不管有沒有 return 語句）
-        let null_constant = compiler.push_constant(Value::Null);
         let null_constant = compiler.push_constant(Value::Null);
         compiler.emit(OpCode::Constant(null_constant));
         compiler.emit(OpCode::Return);

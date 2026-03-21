@@ -71,8 +71,7 @@ pub struct BoundMethodValue {
 }
 
 /// bytecode VM 使用的函式原型。
-#[derive(Debug, Clone)]
-/// 中文註解：closure 在建立時要知道捕獲來源，才能共享正確的 upvalue cell。
+/// closure 在建立時要知道捕獲來源，才能共享正確的 upvalue cell。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureSource {
     Local(usize),

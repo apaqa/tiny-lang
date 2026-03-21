@@ -273,6 +273,7 @@ impl Parser {
             Token::Ident(name) if name == "_" => Ok(Pattern::Wildcard),
             Token::Ident(enum_name) if self.match_token(&Token::ColonColon) => {
                 let variant = self.consume_ident()?;
+                // 支援兩種 binding 語法：{ field1, field2 } 或 (field1, field2)
                 let bindings = if self.match_token(&Token::LBrace) {
                     let mut fields = Vec::new();
                     if !self.check(&Token::RBrace) {
@@ -284,6 +285,19 @@ impl Parser {
                         }
                     }
                     self.expect_token(Token::RBrace)?;
+                    Some(fields)
+                } else if self.match_token(&Token::LParen) {
+                    // 括號語法：Result::Ok(binding) 用於捕獲 variant 欄位
+                    let mut fields = Vec::new();
+                    if !self.check(&Token::RParen) {
+                        loop {
+                            fields.push(self.consume_ident()?);
+                            if !self.match_token(&Token::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect_token(Token::RParen)?;
                     Some(fields)
                 } else {
                     None
