@@ -4,9 +4,11 @@ pub mod ast;
 pub mod compiler;
 pub mod environment;
 pub mod error;
+pub mod formatter;
 pub mod gc;
 pub mod interpreter;
 pub mod lexer;
+pub mod lsp;
 pub mod parser;
 pub mod token;
 pub mod typechecker;
@@ -16,6 +18,7 @@ use std::path::Path;
 
 use ast::Program;
 use error::{Result, TinyLangError};
+use formatter::format_program;
 use interpreter::Interpreter;
 use lexer::Lexer;
 use parser::Parser;
@@ -76,6 +79,12 @@ pub fn compile_and_run_file(path: impl AsRef<Path>) -> Result<()> {
     }
     vm.run(chunk)?;
     Ok(())
+}
+
+/// 中文註解：格式化單一程式字串。
+pub fn format_source(source: &str) -> Result<String> {
+    let program = parse_source(source)?;
+    Ok(format_program(&program))
 }
 
 /// 執行檔案，支援 import（先進行靜態型別檢查）。

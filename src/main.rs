@@ -11,7 +11,8 @@ use std::io::{self, Write};
 use tiny_lang::compiler::{Compiler, disassemble};
 use tiny_lang::error::{Result, TinyLangError};
 use tiny_lang::interpreter::Interpreter;
-use tiny_lang::{compile_and_run, compile_and_run_file, parse_source, run_file};
+use tiny_lang::lsp;
+use tiny_lang::{compile_and_run, compile_and_run_file, format_source, parse_source, run_file};
 
 fn main() {
     if let Err(err) = run() {
@@ -23,19 +24,23 @@ fn main() {
 fn run() -> Result<()> {
     let mut use_vm = false;
     let mut show_disasm = false;
+    let mut use_formatter = false;
+    let mut use_lsp = false;
     let mut path: Option<String> = None;
 
     for arg in env::args().skip(1) {
         match arg.as_str() {
             "--vm" => use_vm = true,
             "--disasm" => show_disasm = true,
+            "--fmt" => use_formatter = true,
+            "--lsp" => use_lsp = true,
             other if other.starts_with("--") => {
                 return Err(TinyLangError::io(format!("unknown flag: {other}")));
             }
             other => {
                 if path.is_some() {
                     return Err(TinyLangError::io(
-                        "usage: cargo run -- [--vm] [--disasm] [file.tiny]",
+                        "usage: cargo run -- [--vm] [--disasm] [--fmt] [--lsp] [file.tiny]",
                     ));
                 }
                 path = Some(other.to_string());
@@ -43,8 +48,20 @@ fn run() -> Result<()> {
         }
     }
 
+    if use_lsp {
+        if path.is_some() || use_vm || show_disasm || use_formatter {
+            return Err(TinyLangError::io("--lsp cannot be combined with other flags"));
+        }
+        lsp::run_stdio().map_err(|err| TinyLangError::io(err.to_string()))?;
+        return Ok(());
+    }
+
     if let Some(path) = path {
         let source = fs::read_to_string(&path)?;
+        if use_formatter {
+            print!("{}", format_source(&source)?);
+            return Ok(());
+        }
         if show_disasm {
             let program = parse_source(&source)?;
             let chunk = Compiler::compile_program(&program)?;
@@ -61,6 +78,8 @@ fn run() -> Result<()> {
         }
     } else if show_disasm {
         return Err(TinyLangError::io("--disasm requires a file path"));
+    } else if use_formatter {
+        return Err(TinyLangError::io("--fmt requires a file path"));
     } else if use_vm {
         repl_vm()?;
     } else {

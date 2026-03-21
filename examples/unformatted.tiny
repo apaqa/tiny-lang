@@ -1,0 +1,4 @@
+struct   User{name:str,age:int}
+fn  greet(name:str)->str{ return "hi, "+name;}
+let   result=greet("tiny");
+if result=="hi, tiny"{print(result);}else{print("bad");}

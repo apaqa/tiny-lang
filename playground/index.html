@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>tiny-lang Playground</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --panel: #151b23;
+            --panel-2: #1f2733;
+            --border: #2d3746;
+            --text: #e6edf3;
+            --muted: #93a1b2;
+            --accent: #4cc2ff;
+            --keyword: #ff7b72;
+            --string: #a5d6ff;
+            --number: #79c0ff;
+            --type: #ffa657;
+            --success: #3fb950;
+        }
+
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: "JetBrains Mono", "Fira Code", monospace;
+            background:
+                radial-gradient(circle at top left, rgba(76, 194, 255, 0.18), transparent 28%),
+                radial-gradient(circle at bottom right, rgba(255, 166, 87, 0.15), transparent 24%),
+                var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+        .shell {
+            width: min(1200px, calc(100% - 32px));
+            margin: 32px auto;
+            display: grid;
+            gap: 16px;
+        }
+        .hero, .panel {
+            background: rgba(21, 27, 35, 0.92);
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            backdrop-filter: blur(14px);
+            box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+        }
+        .hero {
+            padding: 24px;
+        }
+        .hero h1 {
+            margin: 0 0 8px;
+            font-size: clamp(28px, 5vw, 44px);
+        }
+        .hero p {
+            margin: 0;
+            color: var(--muted);
+            line-height: 1.6;
+        }
+        .layout {
+            display: grid;
+            grid-template-columns: 1.1fr 0.9fr;
+            gap: 16px;
+        }
+        .panel {
+            overflow: hidden;
+        }
+        .panel header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 14px 18px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(255, 255, 255, 0.02);
+        }
+        .panel header strong {
+            font-size: 14px;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+        textarea {
+            width: 100%;
+            min-height: 440px;
+            padding: 18px;
+            border: 0;
+            outline: none;
+            resize: vertical;
+            background: transparent;
+            color: transparent;
+            caret-color: var(--text);
+            font: inherit;
+            line-height: 1.6;
+            position: relative;
+            z-index: 2;
+        }
+        .editor-wrap {
+            position: relative;
+            min-height: 440px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.01), rgba(0,0,0,0.08));
+        }
+        pre.highlight {
+            position: absolute;
+            inset: 0;
+            margin: 0;
+            padding: 18px;
+            overflow: auto;
+            pointer-events: none;
+            white-space: pre-wrap;
+            word-break: break-word;
+            line-height: 1.6;
+            color: var(--text);
+        }
+        .kw { color: var(--keyword); }
+        .str { color: var(--string); }
+        .num { color: var(--number); }
+        .typ { color: var(--type); }
+        button {
+            border: 0;
+            border-radius: 999px;
+            padding: 10px 18px;
+            background: linear-gradient(135deg, var(--accent), #2ea3ff);
+            color: #06131d;
+            font: inherit;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        .output {
+            padding: 18px;
+            min-height: 440px;
+            white-space: pre-wrap;
+            line-height: 1.7;
+            color: var(--muted);
+            background: linear-gradient(180deg, rgba(63, 185, 80, 0.06), rgba(0, 0, 0, 0));
+        }
+        .tip {
+            color: var(--success);
+            font-size: 14px;
+        }
+        @media (max-width: 900px) {
+            .layout {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="shell">
+        <section class="hero">
+            <h1>tiny-lang Playground</h1>
+            <p>這個 playground 目前只提供 UI 骨架與 mock 執行結果。若要真的執行 tiny-lang，請在本地安裝專案後使用 <code>cargo run -- your_file.tiny</code> 或 <code>cargo run -- --vm your_file.tiny</code>。</p>
+        </section>
+
+        <section class="layout">
+            <article class="panel">
+                <header>
+                    <strong>Editor</strong>
+                    <button id="runButton" type="button">Run</button>
+                </header>
+                <div class="editor-wrap">
+                    <pre class="highlight" id="highlight"></pre>
+                    <textarea id="source">fn greet(name: str) -> str {
+    return "hello, " + name;
+}
+
+print(greet("tiny"));</textarea>
+                </div>
+            </article>
+
+            <article class="panel">
+                <header>
+                    <strong>Output</strong>
+                    <span class="tip">Mock only</span>
+                </header>
+                <div class="output" id="output">按下 Run 後，這裡會顯示 mock 執行結果。</div>
+            </article>
+        </section>
+    </div>
+
+    <script>
+        const source = document.getElementById("source");
+        const highlight = document.getElementById("highlight");
+        const output = document.getElementById("output");
+        const runButton = document.getElementById("runButton");
+
+        function escapeHtml(text) {
+            return text
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;");
+        }
+
+        function highlightTiny(code) {
+            let html = escapeHtml(code);
+            html = html.replace(/\b(fn|let|if|else|while|for|in|return|struct|enum|match|try|catch|print|import)\b/g, '<span class="kw">$1</span>');
+            html = html.replace(/"([^"\\]|\\.)*"/g, '<span class="str">$&</span>');
+            html = html.replace(/\b\d+\b/g, '<span class="num">$&</span>');
+            html = html.replace(/\b(int|str|bool|any)\b/g, '<span class="typ">$1</span>');
+            return html;
+        }
+
+        function syncHighlight() {
+            highlight.innerHTML = highlightTiny(source.value);
+            highlight.scrollTop = source.scrollTop;
+            highlight.scrollLeft = source.scrollLeft;
+        }
+
+        source.addEventListener("input", syncHighlight);
+        source.addEventListener("scroll", syncHighlight);
+        runButton.addEventListener("click", () => {
+            output.textContent = [
+                "tiny-lang playground (mock)",
+                "",
+                "收到的程式碼：",
+                source.value,
+                "",
+                "提示：目前沒有 WASM 執行器，請在本地用 cargo run 執行。"
+            ].join("\n");
+        });
+
+        syncHighlight();
+    </script>
+</body>
+</html>

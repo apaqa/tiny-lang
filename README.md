@@ -1,14 +1,19 @@
 # tiny-lang
 
-tiny-lang 是用 Rust 實作的教學型語言，現在同時提供兩條執行路徑：
+tiny-lang 是用 Rust 實作的小型語言實驗專案，目前同時提供：
 
 - tree-walking interpreter
 - bytecode compiler + virtual machine
+- formatter (`cargo run -- --fmt`)
+- basic Language Server Protocol server (`cargo run -- --lsp`)
 
 ## 範例
 
 ```tiny
-struct Point { x: int, y: int }
+struct Point {
+    x: int,
+    y: int,
+}
 
 fn Point.distance(other: Point) -> int {
     let dx = self.x - other.x;
@@ -20,60 +25,38 @@ let p = Point { x: 10, y: 20 };
 let q = Point { x: 13, y: 24 };
 
 print(p.distance(q));
-
-match p.x {
-    10 => { print("x is ten"); }
-    _ => { print("other"); }
-}
 ```
 
 ## 功能
 
-- 變數宣告、指定與運算式求值
+- 變數宣告、指定與基本運算
 - `if/else`、`while`、`for in`
 - `break`、`continue`、`return`
-- 函式與遞迴
-- 陣列與 map
-- 型別註記：`int`、`str`、`bool`、`[type]`、`{type}`、struct 名稱、`any`
-- `struct` 定義、建立、欄位讀取與欄位修改
-- struct method 與 `self`
-- `match` pattern matching：整數、字串、布林、識別字綁定、`_`
-- bytecode compiler、disassembler 與 VM
-- tree interpreter 保留作為 fallback 與參考實作
-- **靜態型別檢查器**：在 parse 後、執行前走訪 AST，收集所有型別錯誤（不在第一個錯誤停止）
+- 函式、閉包、遞迴
+- array、map、struct、enum、match
+- 基本型別標註與 type checker
+- VM 模式、import、try/catch
+- formatter：固定 4 空格縮排與穩定輸出
+- LSP：parser / type checker diagnostics
 
-## 內建函式
+## 使用方式
 
-- interpreter：`len`、`push`、`pop`、`str`、`int`、`type_of`、`typeof`、`input`、`range`、`keys`、`values`、`abs`、`max`、`min`、`pow`、`split`、`join`、`trim`、`upper`、`lower`、`contains`、`replace`、`sort`、`reverse`、`map`、`filter`、`reduce`、`find`、`assert`
-- VM：`len`、`push`、`pop`、`str`、`int`、`type_of`、`typeof`、`range`
-
-## 執行
-
-- tree interpreter REPL：`cargo run`
+- interpreter REPL：`cargo run`
 - VM REPL：`cargo run -- --vm`
-- 執行檔案（interpreter）：`cargo run -- examples\\showcase.tiny`
-- 執行檔案（VM）：`cargo run -- --vm examples\\showcase.tiny`
-- 顯示 bytecode：`cargo run -- --disasm examples\\showcase.tiny`
-- 顯示 bytecode 並以 VM 執行：`cargo run -- --disasm --vm examples\\showcase.tiny`
-- 測試：`cargo test`
+- 執行檔案：`cargo run -- examples\showcase.tiny`
+- 用 VM 執行檔案：`cargo run -- --vm examples\showcase.tiny`
+- 顯示 bytecode：`cargo run -- --disasm examples\showcase.tiny`
+- 格式化檔案：`cargo run -- --fmt examples\unformatted.tiny`
+- 啟動 LSP：`cargo run -- --lsp`
+- 執行測試：`cargo test`
 
-## Benchmark
+## Playground
 
-- benchmark 範例：[examples/benchmark.tiny](C:/Users/阮/tiny-lang/examples/benchmark.tiny)
-- 建議比較：
-  - interpreter：`cargo run -- examples\\benchmark.tiny`
-  - VM：`cargo run -- --vm examples\\benchmark.tiny`
+- UI 骨架在 [playground/index.html](C:/Users/阮/tiny-lang/playground/index.html)
+- 目前提供深色主題、簡單 regex 高亮與 mock 輸出
+- 真正執行 tiny-lang 仍需在本地使用 `cargo run`
 
-## 速度對比
-
-以下數字會依機器與 build profile 改變。以目前工作區的 `target/debug/tiny-lang.exe` 實測：
-
-| 模式 | benchmark.tiny |
-| --- | --- |
-| tree interpreter | `fib(30)` 在目前 debug build 下觸發 stack overflow |
-| bytecode VM | 約 `3196.8 ms` |
-
-## examples
+## Examples
 
 - `examples/hello.tiny`
 - `examples/fibonacci.tiny`
@@ -83,7 +66,8 @@ match p.x {
 - `examples/struct_demo.tiny`
 - `examples/pattern_match.tiny`
 - `examples/benchmark.tiny`
+- `examples/unformatted.tiny`
 
-## 測試數量
+## 測試
 
-目前共有 **148** 個測試，涵蓋 lexer、parser、interpreter、compiler、VM、型別、struct、method、match、GC、closures、enum、靜態型別檢查器、VM/import/try-catch 一致性與其他標準功能。
+目前共有 **152** 個測試，涵蓋 lexer、parser、interpreter、compiler、VM、type checker、struct、method、match、GC、closure、enum、VM parity、VM import / try-catch 與 formatter。
