@@ -1,12 +1,9 @@
 //! Tree-walking interpreter。
 //!
-//! Phase 2 新增：
-//! - 陣列與索引
-//! - 內建函式
-//! - 字串索引 / 字串比較
-//! - 更清楚的型別錯誤訊息
+//! Phase 3 在這裡加入 for、break/continue、Map、閉包與 try/catch。
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Cursor, Stdin, Stdout, Write};
 use std::rc::Rc;
 
@@ -14,9 +11,17 @@ use crate::ast::{BinaryOperator, Expr, Program, Statement, UnaryOperator};
 use crate::environment::{BuiltinFunction, EnvRef, Environment, FunctionValue, Value};
 use crate::error::{Result, TinyLangError};
 
+/// 迴圈與函式共用的控制流程訊號。
+#[derive(Debug, Clone)]
+enum ControlFlow {
+    Break,
+    Continue,
+    Return(Value),
+}
+
 #[derive(Debug)]
 enum Signal {
-    Return(Value),
+    Control(ControlFlow),
     Error(TinyLangError),
 }
 
@@ -57,9 +62,15 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         match self.execute_block(program, self.env.clone()) {
             Ok(_) => Ok(()),
             Err(Signal::Error(err)) => Err(err),
-            Err(Signal::Return(_)) => Err(TinyLangError::runtime(
-                "return can only appear inside a function",
-            )),
+            Err(Signal::Control(ControlFlow::Return(_))) => {
+                Err(TinyLangError::runtime("return can only appear inside a function"))
+            }
+            Err(Signal::Control(ControlFlow::Break)) => {
+                Err(TinyLangError::runtime("break can only appear inside a loop"))
+            }
+            Err(Signal::Control(ControlFlow::Continue)) => {
+                Err(TinyLangError::runtime("continue can only appear inside a loop"))
+            }
         }
     }
 
@@ -95,26 +106,25 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 self.env.borrow_mut().assign(name, value)?;
                 Ok(Value::Null)
             }
-            Statement::IndexAssignment { array, index, value } => {
-                let array_value = self.env.borrow().get(array)?;
+            Statement::IndexAssignment { target, index, value } => {
+                let target_value = self.evaluate_expr(target)?;
                 let index_value = self.evaluate_expr(index)?;
                 let value = self.evaluate_expr(value)?;
-                self.assign_index(array_value, index_value, value)
+                self.assign_index(target_value, index_value, value)
             }
             Statement::FnDecl { name, params, body } => {
-                self.env.borrow_mut().define(
-                    name.clone(),
-                    Value::Function(FunctionValue {
-                        name: name.clone(),
-                        params: params.clone(),
-                        body: body.clone(),
-                    }),
-                );
+                let function = Value::Function(FunctionValue {
+                    name: Some(name.clone()),
+                    params: params.clone(),
+                    body: body.clone(),
+                    closure: self.env.clone(),
+                });
+                self.env.borrow_mut().define(name.clone(), function);
                 Ok(Value::Null)
             }
             Statement::Return(expr) => {
                 let value = self.evaluate_expr(expr)?;
-                Err(Signal::Return(value))
+                Err(Signal::Control(ControlFlow::Return(value)))
             }
             Statement::IfElse {
                 condition,
@@ -130,10 +140,51 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             }
             Statement::While { condition, body } => {
                 while self.evaluate_expr(condition)?.is_truthy() {
-                    self.execute_block(body, Environment::enclosed(self.env.clone()))?;
+                    match self.execute_block(body, Environment::enclosed(self.env.clone())) {
+                        Ok(_) => {}
+                        Err(Signal::Control(ControlFlow::Break)) => break,
+                        Err(Signal::Control(ControlFlow::Continue)) => continue,
+                        Err(other) => return Err(other),
+                    }
                 }
                 Ok(Value::Null)
             }
+            Statement::ForLoop {
+                variable,
+                iterable,
+                body,
+            } => {
+                let iterable_value = self.evaluate_expr(iterable)?;
+                let items = self.iterate_values(iterable_value)?;
+                for item in items {
+                    let loop_env = Environment::enclosed(self.env.clone());
+                    loop_env.borrow_mut().define(variable.clone(), item);
+                    match self.execute_block(body, loop_env) {
+                        Ok(_) => {}
+                        Err(Signal::Control(ControlFlow::Break)) => break,
+                        Err(Signal::Control(ControlFlow::Continue)) => continue,
+                        Err(other) => return Err(other),
+                    }
+                }
+                Ok(Value::Null)
+            }
+            Statement::Break => Err(Signal::Control(ControlFlow::Break)),
+            Statement::Continue => Err(Signal::Control(ControlFlow::Continue)),
+            Statement::TryCatch {
+                try_body,
+                catch_var,
+                catch_body,
+            } => match self.execute_block(try_body, Environment::enclosed(self.env.clone())) {
+                Ok(_) => Ok(Value::Null),
+                Err(Signal::Error(err)) => {
+                    let catch_env = Environment::enclosed(self.env.clone());
+                    catch_env
+                        .borrow_mut()
+                        .define(catch_var.clone(), Value::String(err.to_string()));
+                    self.execute_block(catch_body, catch_env)
+                }
+                Err(other) => Err(other),
+            },
             Statement::Print(expr) => {
                 let value = self.evaluate_expr(expr)?;
                 writeln!(self.output, "{value}")
@@ -160,10 +211,20 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 }
                 Ok(Value::Array(Rc::new(RefCell::new(values))))
             }
-            Expr::IndexAccess { array, index } => {
-                let array_value = self.evaluate_expr(array)?;
+            Expr::MapLit(items) => {
+                let mut values = HashMap::new();
+                for (key_expr, value_expr) in items {
+                    let key_value = self.evaluate_expr(key_expr)?;
+                    let key = self.expect_map_key(key_value)?;
+                    let value = self.evaluate_expr(value_expr)?;
+                    values.insert(key, value);
+                }
+                Ok(Value::Map(Rc::new(RefCell::new(values))))
+            }
+            Expr::IndexAccess { target, index } => {
+                let target_value = self.evaluate_expr(target)?;
                 let index_value = self.evaluate_expr(index)?;
-                self.read_index(array_value, index_value)
+                self.read_index(target_value, index_value)
             }
             Expr::UnaryOp { op, operand } => {
                 let value = self.evaluate_expr(operand)?;
@@ -193,17 +254,25 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 let right_value = self.evaluate_expr(right)?;
                 self.eval_binary(left_value, *op, right_value)
             }
-            Expr::FnCall { name, args } => self.call_function(name, args),
+            Expr::FnCall { callee, args } => {
+                let callable = self.evaluate_expr(callee)?;
+                self.call_value(callable, args)
+            }
+            Expr::Lambda { params, body } => Ok(Value::Function(FunctionValue {
+                name: None,
+                params: params.clone(),
+                body: body.clone(),
+                closure: self.env.clone(),
+            })),
         }
     }
 
-    fn call_function(&mut self, name: &str, args: &[Expr]) -> RuntimeResult<Value> {
-        let callable = self.env.borrow().get(name)?;
+    fn call_value(&mut self, callable: Value, args: &[Expr]) -> RuntimeResult<Value> {
         match callable {
             Value::Function(function) => self.call_user_function(&function, args),
-            Value::Builtin(builtin) => self.call_builtin(name, builtin, args),
+            Value::Builtin(builtin) => self.call_builtin(builtin, args),
             other => Err(Signal::Error(TinyLangError::runtime(format!(
-                "'{name}' is not callable, got {}",
+                "value of type {} is not callable",
                 other.type_name()
             )))),
         }
@@ -211,15 +280,15 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
 
     fn call_user_function(&mut self, function: &FunctionValue, args: &[Expr]) -> RuntimeResult<Value> {
         if function.params.len() != args.len() {
+            let name = function.name.as_deref().unwrap_or("<lambda>");
             return Err(Signal::Error(TinyLangError::runtime(format!(
-                "Function '{}' expects {} arguments, got {}",
-                function.name,
+                "Function '{name}' expects {} arguments, got {}",
                 function.params.len(),
                 args.len()
             ))));
         }
 
-        let call_env = Environment::enclosed(self.env.clone());
+        let call_env = Environment::enclosed(function.closure.clone());
         for (param, arg_expr) in function.params.iter().zip(args.iter()) {
             let value = self.evaluate_expr(arg_expr)?;
             call_env.borrow_mut().define(param.clone(), value);
@@ -227,26 +296,27 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
 
         match self.execute_block(&function.body, call_env) {
             Ok(value) => Ok(value),
-            Err(Signal::Return(value)) => Ok(value),
+            Err(Signal::Control(ControlFlow::Return(value))) => Ok(value),
             Err(err) => Err(err),
         }
     }
 
-    fn call_builtin(&mut self, name: &str, builtin: BuiltinFunction, args: &[Expr]) -> RuntimeResult<Value> {
+    fn call_builtin(&mut self, builtin: BuiltinFunction, args: &[Expr]) -> RuntimeResult<Value> {
         match builtin {
             BuiltinFunction::Len => {
-                let values = self.eval_args(name, 1, args)?;
+                let values = self.eval_args("len", 1, args)?;
                 match &values[0] {
                     Value::Array(items) => Ok(Value::Int(items.borrow().len() as i64)),
                     Value::String(value) => Ok(Value::Int(value.chars().count() as i64)),
+                    Value::Map(items) => Ok(Value::Int(items.borrow().len() as i64)),
                     other => Err(Signal::Error(TinyLangError::runtime(format!(
-                        "Function 'len' expects Array or String, got {}",
+                        "Function 'len' expects Array, String, or Map, got {}",
                         other.type_name()
                     )))),
                 }
             }
             BuiltinFunction::Push => {
-                let values = self.eval_args(name, 2, args)?;
+                let values = self.eval_args("push", 2, args)?;
                 match &values[0] {
                     Value::Array(items) => {
                         items.borrow_mut().push(values[1].clone());
@@ -259,7 +329,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 }
             }
             BuiltinFunction::Pop => {
-                let values = self.eval_args(name, 1, args)?;
+                let values = self.eval_args("pop", 1, args)?;
                 match &values[0] {
                     Value::Array(items) => Ok(items.borrow_mut().pop().unwrap_or(Value::Null)),
                     other => Err(Signal::Error(TinyLangError::runtime(format!(
@@ -269,19 +339,19 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 }
             }
             BuiltinFunction::Str => {
-                let values = self.eval_args(name, 1, args)?;
+                let values = self.eval_args("str", 1, args)?;
                 Ok(Value::String(values[0].to_string()))
             }
             BuiltinFunction::Int => {
-                let values = self.eval_args(name, 1, args)?;
+                let values = self.eval_args("int", 1, args)?;
                 self.cast_to_int(&values[0])
             }
             BuiltinFunction::TypeOf => {
-                let values = self.eval_args(name, 1, args)?;
+                let values = self.eval_args("type_of", 1, args)?;
                 Ok(Value::String(values[0].type_name_for_builtin().to_string()))
             }
             BuiltinFunction::Input => {
-                let values = self.eval_args(name, 1, args)?;
+                let values = self.eval_args("input", 1, args)?;
                 let prompt = match &values[0] {
                     Value::String(prompt) => prompt.clone(),
                     other => {
@@ -307,6 +377,49 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
 
                 Ok(Value::String(line))
             }
+            BuiltinFunction::Range => {
+                let values = self.eval_args("range", 2, args)?;
+                let start = self.expect_int(values[0].clone(), "range start")?;
+                let end = self.expect_int(values[1].clone(), "range end")?;
+                let items = (start..end).map(Value::Int).collect::<Vec<_>>();
+                Ok(Value::Array(Rc::new(RefCell::new(items))))
+            }
+            BuiltinFunction::Keys => {
+                let values = self.eval_args("keys", 1, args)?;
+                match &values[0] {
+                    Value::Map(items) => {
+                        let mut keys = items.borrow().keys().cloned().collect::<Vec<_>>();
+                        keys.sort();
+                        Ok(Value::Array(Rc::new(RefCell::new(
+                            keys.into_iter().map(Value::String).collect(),
+                        ))))
+                    }
+                    other => Err(Signal::Error(TinyLangError::runtime(format!(
+                        "Function 'keys' expects Map, got {}",
+                        other.type_name()
+                    )))),
+                }
+            }
+            BuiltinFunction::Values => {
+                let values = self.eval_args("values", 1, args)?;
+                match &values[0] {
+                    Value::Map(items) => {
+                        let mut entries = items
+                            .borrow()
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect::<Vec<_>>();
+                        entries.sort_by(|a, b| a.0.cmp(&b.0));
+                        Ok(Value::Array(Rc::new(RefCell::new(
+                            entries.into_iter().map(|(_, value)| value).collect(),
+                        ))))
+                    }
+                    other => Err(Signal::Error(TinyLangError::runtime(format!(
+                        "Function 'values' expects Map, got {}",
+                        other.type_name()
+                    )))),
+                }
+            }
         }
     }
 
@@ -323,6 +436,16 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             values.push(self.evaluate_expr(arg)?);
         }
         Ok(values)
+    }
+
+    fn iterate_values(&self, value: Value) -> RuntimeResult<Vec<Value>> {
+        match value {
+            Value::Array(items) => Ok(items.borrow().clone()),
+            other => Err(Signal::Error(TinyLangError::runtime(format!(
+                "for loop expects Array iterable, got {}",
+                other.type_name()
+            )))),
+        }
     }
 
     fn cast_to_int(&self, value: &Value) -> RuntimeResult<Value> {
@@ -344,9 +467,9 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
     }
 
     fn assign_index(&mut self, target: Value, index: Value, value: Value) -> RuntimeResult<Value> {
-        let idx = self.expect_index(index)?;
         match target {
             Value::Array(items) => {
+                let idx = self.expect_index(index)?;
                 let mut items = items.borrow_mut();
                 if idx >= items.len() {
                     return Err(Signal::Error(TinyLangError::runtime(format!(
@@ -358,17 +481,22 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 items[idx] = value;
                 Ok(Value::Null)
             }
+            Value::Map(items) => {
+                let key = self.expect_map_key(index)?;
+                items.borrow_mut().insert(key, value);
+                Ok(Value::Null)
+            }
             other => Err(Signal::Error(TinyLangError::runtime(format!(
-                "Index assignment expects Array, got {}",
+                "Index assignment expects Array or Map, got {}",
                 other.type_name()
             )))),
         }
     }
 
     fn read_index(&self, target: Value, index: Value) -> RuntimeResult<Value> {
-        let idx = self.expect_index(index)?;
         match target {
             Value::Array(items) => {
+                let idx = self.expect_index(index)?;
                 let items = items.borrow();
                 items.get(idx).cloned().ok_or_else(|| {
                     Signal::Error(TinyLangError::runtime(format!(
@@ -379,6 +507,7 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 })
             }
             Value::String(text) => {
+                let idx = self.expect_index(index)?;
                 let chars: Vec<char> = text.chars().collect();
                 chars.get(idx).map(|ch| Value::String(ch.to_string())).ok_or_else(|| {
                     Signal::Error(TinyLangError::runtime(format!(
@@ -388,8 +517,12 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                     )))
                 })
             }
+            Value::Map(items) => {
+                let key = self.expect_map_key(index)?;
+                Ok(items.borrow().get(&key).cloned().unwrap_or(Value::Null))
+            }
             other => Err(Signal::Error(TinyLangError::runtime(format!(
-                "Index access expects Array or String, got {}",
+                "Index access expects Array, String, or Map, got {}",
                 other.type_name()
             )))),
         }
@@ -404,6 +537,26 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             )))),
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "Index must be Int, got {}",
+                other.type_name()
+            )))),
+        }
+    }
+
+    fn expect_map_key(&self, value: Value) -> RuntimeResult<String> {
+        match value {
+            Value::String(key) => Ok(key),
+            other => Err(Signal::Error(TinyLangError::runtime(format!(
+                "Map key must be String, got {}",
+                other.type_name()
+            )))),
+        }
+    }
+
+    fn expect_int(&self, value: Value, label: &str) -> RuntimeResult<i64> {
+        match value {
+            Value::Int(number) => Ok(number),
+            other => Err(Signal::Error(TinyLangError::runtime(format!(
+                "{label} must be Int, got {}",
                 other.type_name()
             )))),
         }
@@ -496,4 +649,7 @@ fn install_builtins(env: &EnvRef) {
     env.define("int".into(), Value::Builtin(BuiltinFunction::Int));
     env.define("type_of".into(), Value::Builtin(BuiltinFunction::TypeOf));
     env.define("input".into(), Value::Builtin(BuiltinFunction::Input));
+    env.define("range".into(), Value::Builtin(BuiltinFunction::Range));
+    env.define("keys".into(), Value::Builtin(BuiltinFunction::Keys));
+    env.define("values".into(), Value::Builtin(BuiltinFunction::Values));
 }

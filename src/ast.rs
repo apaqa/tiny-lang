@@ -1,18 +1,17 @@
-//! AST（抽象語法樹）定義。
+//! 抽象語法樹（AST）定義。
 //!
-//! AST 是 parser 輸出的樹狀結構。
-//! interpreter 不需要再面對原始字串，
-//! 只要沿著 AST 節點逐步執行即可。
+//! parser 會把 token 串整理成 AST，
+//! interpreter 再依照這裡的結構執行程式。
 
-/// 一份程式就是一串 statement。
+/// 整份程式就是 statement 的列表。
 pub type Program = Vec<Statement>;
 
-/// 陳述式。
+/// 可執行的敘述節點。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     LetDecl { name: String, value: Expr },
     Assignment { name: String, value: Expr },
-    IndexAssignment { array: String, index: Expr, value: Expr },
+    IndexAssignment { target: Expr, index: Expr, value: Expr },
     FnDecl {
         name: String,
         params: Vec<String>,
@@ -28,11 +27,23 @@ pub enum Statement {
         condition: Expr,
         body: Vec<Statement>,
     },
+    ForLoop {
+        variable: String,
+        iterable: Expr,
+        body: Vec<Statement>,
+    },
+    Break,
+    Continue,
+    TryCatch {
+        try_body: Vec<Statement>,
+        catch_var: String,
+        catch_body: Vec<Statement>,
+    },
     Print(Expr),
     ExprStatement(Expr),
 }
 
-/// 表達式。
+/// 可計算出值的表達式節點。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     IntLit(i64),
@@ -40,8 +51,9 @@ pub enum Expr {
     BoolLit(bool),
     Ident(String),
     ArrayLit(Vec<Expr>),
+    MapLit(Vec<(Expr, Expr)>),
     IndexAccess {
-        array: Box<Expr>,
+        target: Box<Expr>,
         index: Box<Expr>,
     },
     BinaryOp {
@@ -54,8 +66,12 @@ pub enum Expr {
         operand: Box<Expr>,
     },
     FnCall {
-        name: String,
+        callee: Box<Expr>,
         args: Vec<Expr>,
+    },
+    Lambda {
+        params: Vec<String>,
+        body: Vec<Statement>,
     },
 }
 

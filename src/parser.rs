@@ -1,14 +1,11 @@
-//! Parser（語法分析器）。
+//! Parser 實作。
 //!
-//! 這裡使用遞迴下降 parser。
-//! Phase 2 新增：
-//! - 陣列字面量
-//! - index access
-//! - index assignment
+//! 這裡使用遞迴下降 parser，將 token 串轉成 AST。
+//! Phase 3 追加了 for、map、lambda、try/catch 與 break/continue。
 
 use crate::ast::{BinaryOperator, Expr, Program, Statement, UnaryOperator};
 use crate::error::{Result, TinyLangError};
-use crate::token::{Span, SpannedToken, Token};
+use crate::token::{SpannedToken, Token};
 
 pub struct Parser {
     tokens: Vec<SpannedToken>,
@@ -31,10 +28,14 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement> {
         match &self.peek().token {
             Token::Let => self.parse_let_decl(),
-            Token::Fn => self.parse_fn_decl(),
+            Token::Fn if matches!(self.peek_next_token(), Some(Token::Ident(_))) => self.parse_fn_decl(),
             Token::Return => self.parse_return_stmt(),
             Token::If => self.parse_if_else_stmt(),
             Token::While => self.parse_while_stmt(),
+            Token::For => self.parse_for_stmt(),
+            Token::Break => self.parse_break_stmt(),
+            Token::Continue => self.parse_continue_stmt(),
+            Token::Try => self.parse_try_catch_stmt(),
             Token::Print => self.parse_print_stmt(),
             Token::Ident(_) if self.peek_next_token() == Some(&Token::Assign) => self.parse_assignment(),
             Token::Ident(_) if self.looks_like_index_assignment() => self.parse_index_assignment(),
@@ -60,32 +61,33 @@ impl Parser {
     }
 
     fn parse_index_assignment(&mut self) -> Result<Statement> {
-        let array = self.consume_ident()?;
-        self.expect_token(Token::LBracket)?;
-        let index = self.parse_expression()?;
-        self.expect_token(Token::RBracket)?;
-        self.expect_token(Token::Assign)?;
-        let value = self.parse_expression()?;
-        self.expect_token(Token::Semicolon)?;
-        Ok(Statement::IndexAssignment { array, index, value })
+        let mut target = Expr::Ident(self.consume_ident()?);
+        while self.match_token(&Token::LBracket) {
+            let index = self.parse_expression()?;
+            self.expect_token(Token::RBracket)?;
+            if self.check(&Token::Assign) {
+                self.expect_token(Token::Assign)?;
+                let value = self.parse_expression()?;
+                self.expect_token(Token::Semicolon)?;
+                return Ok(Statement::IndexAssignment { target, index, value });
+            }
+
+            target = Expr::IndexAccess {
+                target: Box::new(target),
+                index: Box::new(index),
+            };
+        }
+
+        Err(TinyLangError::parse(
+            "expected '=' after index assignment target",
+            self.peek().span,
+        ))
     }
 
     fn parse_fn_decl(&mut self) -> Result<Statement> {
         self.expect_token(Token::Fn)?;
         let name = self.consume_ident()?;
-        self.expect_token(Token::LParen)?;
-
-        let mut params = Vec::new();
-        if !self.check(&Token::RParen) {
-            loop {
-                params.push(self.consume_ident()?);
-                if !self.match_token(&Token::Comma) {
-                    break;
-                }
-            }
-        }
-
-        self.expect_token(Token::RParen)?;
+        let params = self.parse_parameter_list()?;
         let body = self.parse_block()?;
         Ok(Statement::FnDecl { name, params, body })
     }
@@ -121,6 +123,44 @@ impl Parser {
         Ok(Statement::While { condition, body })
     }
 
+    fn parse_for_stmt(&mut self) -> Result<Statement> {
+        self.expect_token(Token::For)?;
+        let variable = self.consume_ident()?;
+        self.expect_token(Token::In)?;
+        let iterable = self.parse_expression()?;
+        let body = self.parse_block()?;
+        Ok(Statement::ForLoop {
+            variable,
+            iterable,
+            body,
+        })
+    }
+
+    fn parse_break_stmt(&mut self) -> Result<Statement> {
+        self.expect_token(Token::Break)?;
+        self.expect_token(Token::Semicolon)?;
+        Ok(Statement::Break)
+    }
+
+    fn parse_continue_stmt(&mut self) -> Result<Statement> {
+        self.expect_token(Token::Continue)?;
+        self.expect_token(Token::Semicolon)?;
+        Ok(Statement::Continue)
+    }
+
+    fn parse_try_catch_stmt(&mut self) -> Result<Statement> {
+        self.expect_token(Token::Try)?;
+        let try_body = self.parse_block()?;
+        self.expect_token(Token::Catch)?;
+        let catch_var = self.consume_ident()?;
+        let catch_body = self.parse_block()?;
+        Ok(Statement::TryCatch {
+            try_body,
+            catch_var,
+            catch_body,
+        })
+    }
+
     fn parse_print_stmt(&mut self) -> Result<Statement> {
         self.expect_token(Token::Print)?;
         self.expect_token(Token::LParen)?;
@@ -144,6 +184,36 @@ impl Parser {
         }
         self.expect_token(Token::RBrace)?;
         Ok(statements)
+    }
+
+    fn parse_parameter_list(&mut self) -> Result<Vec<String>> {
+        self.expect_token(Token::LParen)?;
+        let mut params = Vec::new();
+        if !self.check(&Token::RParen) {
+            loop {
+                params.push(self.consume_ident()?);
+                if !self.match_token(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect_token(Token::RParen)?;
+        Ok(params)
+    }
+
+    fn parse_lambda_pipe_params(&mut self) -> Result<Vec<String>> {
+        self.expect_token(Token::Pipe)?;
+        let mut params = Vec::new();
+        if !self.check(&Token::Pipe) {
+            loop {
+                params.push(self.consume_ident()?);
+                if !self.match_token(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect_token(Token::Pipe)?;
+        Ok(params)
     }
 
     fn parse_expression(&mut self) -> Result<Expr> {
@@ -265,16 +335,6 @@ impl Parser {
 
         loop {
             if self.match_token(&Token::LParen) {
-                let name = match expr {
-                    Expr::Ident(name) => name,
-                    _ => {
-                        return Err(TinyLangError::parse(
-                            "only an identifier can be called like a function",
-                            self.previous_span(),
-                        ));
-                    }
-                };
-
                 let mut args = Vec::new();
                 if !self.check(&Token::RParen) {
                     loop {
@@ -285,7 +345,10 @@ impl Parser {
                     }
                 }
                 self.expect_token(Token::RParen)?;
-                expr = Expr::FnCall { name, args };
+                expr = Expr::FnCall {
+                    callee: Box::new(expr),
+                    args,
+                };
                 continue;
             }
 
@@ -293,7 +356,7 @@ impl Parser {
                 let index = self.parse_expression()?;
                 self.expect_token(Token::RBracket)?;
                 expr = Expr::IndexAccess {
-                    array: Box::new(expr),
+                    target: Box::new(expr),
                     index: Box::new(index),
                 };
                 continue;
@@ -306,24 +369,31 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr> {
-        let token = self.advance().clone();
-        match token.token {
-            Token::IntLit(value) => Ok(Expr::IntLit(value)),
-            Token::StringLit(value) => Ok(Expr::StringLit(value)),
-            Token::BoolLit(value) => Ok(Expr::BoolLit(value)),
-            Token::True => Ok(Expr::BoolLit(true)),
-            Token::False => Ok(Expr::BoolLit(false)),
-            Token::Ident(name) => Ok(Expr::Ident(name)),
-            Token::LParen => {
-                let expr = self.parse_expression()?;
-                self.expect_token(Token::RParen)?;
-                Ok(expr)
+        match self.peek().token.clone() {
+            Token::Fn => self.parse_fn_lambda(),
+            Token::Pipe => self.parse_pipe_lambda(),
+            _ => {
+                let token = self.advance().clone();
+                match token.token {
+                    Token::IntLit(value) => Ok(Expr::IntLit(value)),
+                    Token::StringLit(value) => Ok(Expr::StringLit(value)),
+                    Token::BoolLit(value) => Ok(Expr::BoolLit(value)),
+                    Token::True => Ok(Expr::BoolLit(true)),
+                    Token::False => Ok(Expr::BoolLit(false)),
+                    Token::Ident(name) => Ok(Expr::Ident(name)),
+                    Token::LParen => {
+                        let expr = self.parse_expression()?;
+                        self.expect_token(Token::RParen)?;
+                        Ok(expr)
+                    }
+                    Token::LBracket => self.parse_array_literal(),
+                    Token::LBrace => self.parse_map_literal(),
+                    other => Err(TinyLangError::parse(
+                        format!("unexpected token in expression: {other:?}"),
+                        token.span,
+                    )),
+                }
             }
-            Token::LBracket => self.parse_array_literal(),
-            other => Err(TinyLangError::parse(
-                format!("unexpected token in expression: {other:?}"),
-                token.span,
-            )),
         }
     }
 
@@ -341,6 +411,40 @@ impl Parser {
         Ok(Expr::ArrayLit(items))
     }
 
+    fn parse_map_literal(&mut self) -> Result<Expr> {
+        let mut items = Vec::new();
+        if !self.check(&Token::RBrace) {
+            loop {
+                let key = self.parse_expression()?;
+                self.expect_token(Token::Colon)?;
+                let value = self.parse_expression()?;
+                items.push((key, value));
+                if !self.match_token(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect_token(Token::RBrace)?;
+        Ok(Expr::MapLit(items))
+    }
+
+    fn parse_fn_lambda(&mut self) -> Result<Expr> {
+        self.expect_token(Token::Fn)?;
+        let params = self.parse_parameter_list()?;
+        let body = self.parse_block()?;
+        Ok(Expr::Lambda { params, body })
+    }
+
+    fn parse_pipe_lambda(&mut self) -> Result<Expr> {
+        let params = self.parse_lambda_pipe_params()?;
+        let body = if self.check(&Token::LBrace) {
+            self.parse_block()?
+        } else {
+            vec![Statement::Return(self.parse_expression()?)]
+        };
+        Ok(Expr::Lambda { params, body })
+    }
+
     fn looks_like_index_assignment(&self) -> bool {
         if !matches!(self.peek().token, Token::Ident(_)) || self.peek_next_token() != Some(&Token::LBracket) {
             return false;
@@ -354,14 +458,16 @@ impl Parser {
                 Token::LBracket => depth += 1,
                 Token::RBracket => {
                     depth -= 1;
-                    if depth == 0 {
-                        return matches!(
+                    if depth == 0
+                        && matches!(
                             self.tokens.get(cursor + 1).map(|token| &token.token),
                             Some(Token::Assign)
-                        );
+                        )
+                    {
+                        return true;
                     }
                 }
-                Token::Eof => return false,
+                Token::Semicolon | Token::Eof => return false,
                 _ => {}
             }
             cursor += 1;
@@ -416,14 +522,6 @@ impl Parser {
 
     fn peek_next_token(&self) -> Option<&Token> {
         self.tokens.get(self.position + 1).map(|item| &item.token)
-    }
-
-    fn previous_span(&self) -> Span {
-        if self.position == 0 {
-            self.peek().span
-        } else {
-            self.tokens[self.position - 1].span
-        }
     }
 
     fn advance(&mut self) -> &SpannedToken {

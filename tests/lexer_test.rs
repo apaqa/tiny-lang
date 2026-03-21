@@ -1,3 +1,5 @@
+//! Lexer 測試，確認關鍵字與基本符號能正確切詞。
+
 use tiny_lang::lexer::Lexer;
 use tiny_lang::token::Token;
 
@@ -83,4 +85,20 @@ fn tokenize_string_and_number() {
     assert!(tokens.contains(&Token::IntLit(12345)));
     assert!(tokens.contains(&Token::LBracket));
     assert!(tokens.contains(&Token::RBracket));
+}
+
+#[test]
+fn tokenize_phase3_keywords_and_symbols() {
+    let source = r#"for x in range(0, 2) { break; continue; } try { let m = {"k": 1}; } catch e { print(e); } let f = |x| x;"#;
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize().unwrap();
+
+    assert!(tokens.contains(&Token::For));
+    assert!(tokens.contains(&Token::In));
+    assert!(tokens.contains(&Token::Break));
+    assert!(tokens.contains(&Token::Continue));
+    assert!(tokens.contains(&Token::Try));
+    assert!(tokens.contains(&Token::Catch));
+    assert!(tokens.contains(&Token::Colon));
+    assert!(tokens.contains(&Token::Pipe));
 }

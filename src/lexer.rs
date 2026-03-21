@@ -1,7 +1,7 @@
-//! Lexer（詞法分析器）。
+//! Lexer 實作。
 //!
-//! 它會把原始程式碼掃描成 token 序列，
-//! 並且記錄每個 token 的起始行列位置。
+//! 這一層把原始碼切成 token，並保留行列資訊，
+//! 讓 parser 與錯誤訊息可以精準指出位置。
 
 use crate::error::{Result, TinyLangError};
 use crate::token::{Span, SpannedToken, Token};
@@ -23,13 +23,13 @@ impl Lexer {
         }
     }
 
-    /// 只回傳 token，保留舊測試與公開 API 的易用性。
+    /// 將輸入切成不帶位置資訊的 token，供舊測試或簡化流程使用。
     pub fn tokenize(&mut self) -> Result<Vec<Token>> {
         let spanned = self.tokenize_with_spans()?;
         Ok(spanned.into_iter().map(|item| item.token).collect())
     }
 
-    /// 給 parser 使用的版本，會保留位置資訊。
+    /// 將輸入切成帶位置資訊的 token 串。
     pub fn tokenize_with_spans(&mut self) -> Result<Vec<SpannedToken>> {
         let mut tokens = Vec::new();
 
@@ -55,6 +55,7 @@ impl Lexer {
                 ']' => tokens.push(self.single_char(Token::RBracket)),
                 ',' => tokens.push(self.single_char(Token::Comma)),
                 ';' => tokens.push(self.single_char(Token::Semicolon)),
+                ':' => tokens.push(self.single_char(Token::Colon)),
                 '=' => tokens.push(self.read_two_char(Token::Assign, '=', Token::Eq)),
                 '!' => tokens.push(self.read_two_char(Token::Not, '=', Token::Ne)),
                 '<' => tokens.push(self.read_two_char(Token::Lt, '=', Token::Le)),
@@ -68,26 +69,18 @@ impl Lexer {
                             span,
                         });
                     } else {
-                        return Err(TinyLangError::lex(
-                            "single '&' is not valid, use &&",
-                            span,
-                        ));
+                        return Err(TinyLangError::lex("single '&' is not valid, use &&", span));
                     }
                 }
                 '|' => {
                     let span = self.current_span();
                     self.advance();
-                    if self.match_char('|') {
-                        tokens.push(SpannedToken {
-                            token: Token::Or,
-                            span,
-                        });
+                    let token = if self.match_char('|') {
+                        Token::Or
                     } else {
-                        return Err(TinyLangError::lex(
-                            "single '|' is not valid, use ||",
-                            span,
-                        ));
-                    }
+                        Token::Pipe
+                    };
+                    tokens.push(SpannedToken { token, span });
                 }
                 _ => {
                     return Err(TinyLangError::lex(
@@ -233,6 +226,12 @@ impl Lexer {
             "if" => Token::If,
             "else" => Token::Else,
             "while" => Token::While,
+            "for" => Token::For,
+            "in" => Token::In,
+            "break" => Token::Break,
+            "continue" => Token::Continue,
+            "try" => Token::Try,
+            "catch" => Token::Catch,
             "print" => Token::Print,
             "true" => Token::BoolLit(true),
             "false" => Token::BoolLit(false),

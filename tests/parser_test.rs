@@ -1,3 +1,5 @@
+//! Parser 測試，確認 AST 結構與優先順序正確。
+
 use tiny_lang::ast::{BinaryOperator, Expr, Statement};
 use tiny_lang::parse_source;
 
@@ -110,4 +112,34 @@ fn parse_parenthesized_expression() {
 
     assert_eq!(**inner_left, Expr::IntLit(1));
     assert_eq!(**inner_right, Expr::IntLit(2));
+}
+
+#[test]
+fn parse_phase3_statements_and_expressions() {
+    let source = r#"
+        for x in range(0, 3) {
+            if x == 1 { continue; }
+            break;
+        }
+        let m = {"name": "Alice"};
+        let f = |x| x * 2;
+        try { print(m["name"]); } catch e { print(e); }
+    "#;
+
+    let program = parse_source(source).unwrap();
+
+    assert!(matches!(program[0], Statement::ForLoop { .. }));
+    assert!(matches!(program[1], Statement::LetDecl { .. }));
+    assert!(matches!(program[2], Statement::LetDecl { .. }));
+    assert!(matches!(program[3], Statement::TryCatch { .. }));
+
+    let Statement::LetDecl { value, .. } = &program[1] else {
+        panic!("expected map let declaration");
+    };
+    assert!(matches!(value, Expr::MapLit(_)));
+
+    let Statement::LetDecl { value, .. } = &program[2] else {
+        panic!("expected lambda let declaration");
+    };
+    assert!(matches!(value, Expr::Lambda { .. }));
 }

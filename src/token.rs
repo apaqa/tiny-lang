@@ -1,10 +1,9 @@
-//! Token 與位置信息定義。
+//! Token 定義。
 //!
-//! Phase 2 開始，我們除了保留 token 種類，
-//! 也讓 lexer 可以附帶每個 token 的行列位置，
-//! 方便 parser 產生更好的錯誤訊息。
+//! 這個檔案集中 tiny-lang 的詞彙單位，供 lexer 產生、
+//! parser 消費，並讓錯誤訊息可以攜帶對應位置。
 
-/// 原始碼中的一個位置。
+/// 原始碼中的行列位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     pub line: usize,
@@ -17,14 +16,14 @@ impl Span {
     }
 }
 
-/// 附帶位置資訊的 token。
+/// 帶有位置資訊的 token。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpannedToken {
     pub token: Token,
     pub span: Span,
 }
 
-/// tiny-lang 的所有 token。
+/// tiny-lang 的所有 token 種類。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Let,
@@ -33,6 +32,12 @@ pub enum Token {
     If,
     Else,
     While,
+    For,
+    In,
+    Break,
+    Continue,
+    Try,
+    Catch,
     Print,
     True,
     False,
@@ -55,6 +60,8 @@ pub enum Token {
     And,
     Or,
     Not,
+    Pipe,
+    Colon,
     LParen,
     RParen,
     LBrace,

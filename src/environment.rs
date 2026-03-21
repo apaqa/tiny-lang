@@ -1,7 +1,6 @@
-//! Environment（執行期作用域）。
+//! Environment 與執行期值。
 //!
-//! 這裡管理變數與函式的查找。
-//! Phase 2 的陣列是可變資料，因此會用共享所有權保存。
+//! 這裡負責變數作用域、閉包捕獲環境，以及執行期 Value 型別。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -10,30 +9,35 @@ use std::rc::Rc;
 use crate::ast::Statement;
 use crate::error::{Result, TinyLangError};
 
-/// 陣列的共享表示。
+/// 陣列採共享可變參考，讓函式與閉包能共用同一份資料。
 pub type ArrayRef = Rc<RefCell<Vec<Value>>>;
 
-/// 執行期值。
+/// Map 也採共享可變參考，方便索引寫入與跨作用域共享。
+pub type MapRef = Rc<RefCell<HashMap<String, Value>>>;
+
+/// 執行期會流動的值。
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
     String(String),
     Bool(bool),
     Array(ArrayRef),
+    Map(MapRef),
     Function(FunctionValue),
     Builtin(BuiltinFunction),
     Null,
 }
 
-/// 使用者定義函式。
-#[derive(Debug, Clone, PartialEq)]
+/// 使用者定義函式或 lambda 的執行期表示。
+#[derive(Debug, Clone)]
 pub struct FunctionValue {
-    pub name: String,
+    pub name: Option<String>,
     pub params: Vec<String>,
     pub body: Vec<Statement>,
+    pub closure: EnvRef,
 }
 
-/// 內建函式。
+/// 內建函式清單。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinFunction {
     Len,
@@ -43,6 +47,9 @@ pub enum BuiltinFunction {
     Int,
     TypeOf,
     Input,
+    Range,
+    Keys,
+    Values,
 }
 
 pub type EnvRef = Rc<RefCell<Environment>>;
@@ -81,9 +88,7 @@ impl Environment {
             return parent.borrow().get(name);
         }
 
-        Err(TinyLangError::runtime(format!(
-            "Variable '{name}' not defined"
-        )))
+        Err(TinyLangError::runtime(format!("Variable '{name}' not defined")))
     }
 
     pub fn assign(&mut self, name: &str, value: Value) -> Result<()> {
@@ -96,9 +101,7 @@ impl Environment {
             return parent.borrow_mut().assign(name, value);
         }
 
-        Err(TinyLangError::runtime(format!(
-            "Variable '{name}' not defined"
-        )))
+        Err(TinyLangError::runtime(format!("Variable '{name}' not defined")))
     }
 }
 
@@ -109,6 +112,7 @@ impl Value {
             Value::Int(value) => *value != 0,
             Value::String(value) => !value.is_empty(),
             Value::Array(items) => !items.borrow().is_empty(),
+            Value::Map(items) => !items.borrow().is_empty(),
             Value::Function(_) | Value::Builtin(_) => true,
             Value::Null => false,
         }
@@ -120,6 +124,7 @@ impl Value {
             Value::String(_) => "String",
             Value::Bool(_) => "Bool",
             Value::Array(_) => "Array",
+            Value::Map(_) => "Map",
             Value::Function(_) | Value::Builtin(_) => "Function",
             Value::Null => "Null",
         }
@@ -131,11 +136,20 @@ impl Value {
             Value::String(_) => "string",
             Value::Bool(_) => "bool",
             Value::Array(_) => "array",
+            Value::Map(_) => "map",
             Value::Function(_) | Value::Builtin(_) => "function",
             Value::Null => "null",
         }
     }
 }
+
+impl PartialEq for FunctionValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.params == other.params && self.body == other.body
+    }
+}
+
+impl Eq for FunctionValue {}
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
@@ -145,6 +159,7 @@ impl PartialEq for Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Null, Value::Null) => true,
             (Value::Array(a), Value::Array(b)) => *a.borrow() == *b.borrow(),
+            (Value::Map(a), Value::Map(b)) => *a.borrow() == *b.borrow(),
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Function(a), Value::Function(b)) => a == b,
             _ => false,
@@ -169,7 +184,19 @@ impl std::fmt::Display for Value {
                     .join(", ");
                 write!(f, "[{rendered}]")
             }
-            Value::Function(function) => write!(f, "<fn {}>", function.name),
+            Value::Map(items) => {
+                let mut entries = items
+                    .borrow()
+                    .iter()
+                    .map(|(key, value)| format!("\"{key}\": {value}"))
+                    .collect::<Vec<_>>();
+                entries.sort();
+                write!(f, "{{{}}}", entries.join(", "))
+            }
+            Value::Function(function) => match &function.name {
+                Some(name) => write!(f, "<fn {name}>"),
+                None => write!(f, "<lambda>"),
+            },
             Value::Builtin(_) => write!(f, "<builtin>"),
             Value::Null => write!(f, "null"),
         }
