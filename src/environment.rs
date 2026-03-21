@@ -1,10 +1,14 @@
 //! 執行環境與執行期值定義。
+//!
+//! tree-walking interpreter 與 bytecode VM 會共用大部分執行期值，
+//! 這裡集中管理 Value、函式、struct 定義與詞法環境。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::{Statement, TypeAnnotation};
+use crate::compiler::Chunk;
 use crate::error::{Result, TinyLangError};
 
 /// Array 的共享引用。
@@ -27,6 +31,9 @@ pub enum Value {
     StructInstance(StructInstanceValue),
     Function(FunctionValue),
     BoundMethod(BoundMethodValue),
+    CompiledFunction(Rc<CompiledFunction>),
+    NativeFunction(NativeFunction),
+    VmBoundMethod(VmBoundMethodValue),
     Builtin(BuiltinFunction),
     Null,
 }
@@ -38,7 +45,7 @@ pub struct Binding {
     pub type_annotation: Option<TypeAnnotation>,
 }
 
-/// 使用者函式或 lambda 的執行期表示。
+/// tree-walking interpreter 使用的函式表示。
 #[derive(Debug, Clone)]
 pub struct FunctionValue {
     pub name: Option<String>,
@@ -62,14 +69,50 @@ pub struct StructInstanceValue {
     pub fields: StructFieldsRef,
 }
 
-/// 綁定 receiver 後的方法值。
+/// tree-walking interpreter 綁定 receiver 後的方法值。
 #[derive(Debug, Clone)]
 pub struct BoundMethodValue {
     pub receiver: StructInstanceValue,
     pub method: FunctionValue,
 }
 
-/// 內建函式表。
+/// bytecode VM 使用的已編譯函式。
+#[derive(Debug, Clone)]
+pub struct CompiledFunction {
+    pub name: Option<String>,
+    pub params: Vec<(String, Option<TypeAnnotation>)>,
+    pub return_type: Option<TypeAnnotation>,
+    pub chunk: Rc<Chunk>,
+    pub local_count: usize,
+    pub takes_self: bool,
+}
+
+impl CompiledFunction {
+    pub fn arity(&self) -> usize {
+        self.params.len()
+    }
+}
+
+/// VM 的原生函式值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeFunction {
+    Len,
+    Push,
+    Pop,
+    Str,
+    Int,
+    TypeOf,
+    Range,
+}
+
+/// VM 綁定 receiver 後的方法值。
+#[derive(Debug, Clone)]
+pub struct VmBoundMethodValue {
+    pub receiver: StructInstanceValue,
+    pub method: Rc<CompiledFunction>,
+}
+
+/// tree interpreter 的內建函式表。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinFunction {
     Len,
@@ -233,7 +276,12 @@ impl Value {
             Value::Array(items) => !items.borrow().is_empty(),
             Value::Map(items) => !items.borrow().is_empty(),
             Value::StructInstance(_) => true,
-            Value::Function(_) | Value::BoundMethod(_) | Value::Builtin(_) => true,
+            Value::Function(_)
+            | Value::BoundMethod(_)
+            | Value::CompiledFunction(_)
+            | Value::NativeFunction(_)
+            | Value::VmBoundMethod(_)
+            | Value::Builtin(_) => true,
             Value::Null => false,
         }
     }
@@ -246,7 +294,12 @@ impl Value {
             Value::Array(_) => "Array",
             Value::Map(_) => "Map",
             Value::StructInstance(_) => "Struct",
-            Value::Function(_) | Value::BoundMethod(_) | Value::Builtin(_) => "Function",
+            Value::Function(_)
+            | Value::BoundMethod(_)
+            | Value::CompiledFunction(_)
+            | Value::NativeFunction(_)
+            | Value::VmBoundMethod(_)
+            | Value::Builtin(_) => "Function",
             Value::Null => "Null",
         }
     }
@@ -259,7 +312,12 @@ impl Value {
             Value::Array(_) => "array".into(),
             Value::Map(_) => "map".into(),
             Value::StructInstance(instance) => instance.type_name.clone(),
-            Value::Function(_) | Value::BoundMethod(_) | Value::Builtin(_) => "function".into(),
+            Value::Function(_)
+            | Value::BoundMethod(_)
+            | Value::CompiledFunction(_)
+            | Value::NativeFunction(_)
+            | Value::VmBoundMethod(_)
+            | Value::Builtin(_) => "function".into(),
             Value::Null => "null".into(),
         }
     }
@@ -287,7 +345,12 @@ impl Value {
                 }
             }
             Value::StructInstance(instance) => instance.type_name.clone(),
-            Value::Function(_) | Value::BoundMethod(_) | Value::Builtin(_) => "function".into(),
+            Value::Function(_)
+            | Value::BoundMethod(_)
+            | Value::CompiledFunction(_)
+            | Value::NativeFunction(_)
+            | Value::VmBoundMethod(_)
+            | Value::Builtin(_) => "function".into(),
             Value::Null => "null".into(),
         }
     }
@@ -320,6 +383,27 @@ impl PartialEq for BoundMethodValue {
 
 impl Eq for BoundMethodValue {}
 
+impl PartialEq for CompiledFunction {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.params == other.params
+            && self.return_type == other.return_type
+            && self.local_count == other.local_count
+            && self.takes_self == other.takes_self
+            && self.chunk == other.chunk
+    }
+}
+
+impl Eq for CompiledFunction {}
+
+impl PartialEq for VmBoundMethodValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.receiver == other.receiver && self.method == other.method
+    }
+}
+
+impl Eq for VmBoundMethodValue {}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -333,6 +417,9 @@ impl PartialEq for Value {
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Function(a), Value::Function(b)) => a == b,
             (Value::BoundMethod(a), Value::BoundMethod(b)) => a == b,
+            (Value::CompiledFunction(a), Value::CompiledFunction(b)) => a == b,
+            (Value::NativeFunction(a), Value::NativeFunction(b)) => a == b,
+            (Value::VmBoundMethod(a), Value::VmBoundMethod(b)) => a == b,
             _ => false,
         }
     }
@@ -382,8 +469,43 @@ impl std::fmt::Display for Value {
                 Some(name) => write!(f, "<bound {name}>"),
                 None => write!(f, "<bound method>"),
             },
+            Value::CompiledFunction(function) => match &function.name {
+                Some(name) => write!(f, "<compiled {name}>"),
+                None => write!(f, "<compiled lambda>"),
+            },
+            Value::NativeFunction(native) => write!(f, "<native {}>", native.name()),
+            Value::VmBoundMethod(method) => match &method.method.name {
+                Some(name) => write!(f, "<bound {name}>"),
+                None => write!(f, "<bound vm method>"),
+            },
             Value::Builtin(_) => write!(f, "<builtin>"),
             Value::Null => write!(f, "null"),
+        }
+    }
+}
+
+impl NativeFunction {
+    pub fn name(&self) -> &'static str {
+        match self {
+            NativeFunction::Len => "len",
+            NativeFunction::Push => "push",
+            NativeFunction::Pop => "pop",
+            NativeFunction::Str => "str",
+            NativeFunction::Int => "int",
+            NativeFunction::TypeOf => "type_of",
+            NativeFunction::Range => "range",
+        }
+    }
+
+    pub fn arity(&self) -> usize {
+        match self {
+            NativeFunction::Len => 1,
+            NativeFunction::Push => 2,
+            NativeFunction::Pop => 1,
+            NativeFunction::Str => 1,
+            NativeFunction::Int => 1,
+            NativeFunction::TypeOf => 1,
+            NativeFunction::Range => 2,
         }
     }
 }

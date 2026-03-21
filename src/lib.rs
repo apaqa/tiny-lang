@@ -8,6 +8,7 @@ pub mod interpreter;
 pub mod lexer;
 pub mod parser;
 pub mod token;
+pub mod vm;
 
 use std::path::Path;
 
@@ -16,6 +17,7 @@ use error::Result;
 use interpreter::Interpreter;
 use lexer::Lexer;
 use parser::Parser;
+use vm::VM;
 
 /// 把原始碼 parse 成 AST。
 pub fn parse_source(source: &str) -> Result<Program> {
@@ -30,6 +32,15 @@ pub fn run_source(source: &str) -> Result<()> {
     let program = parse_source(source)?;
     let mut interpreter = Interpreter::new();
     interpreter.interpret(&program)
+}
+
+/// 使用 bytecode compiler + VM 執行原始碼。
+pub fn compile_and_run(source: &str) -> Result<()> {
+    let program = parse_source(source)?;
+    let chunk = compiler::Compiler::compile_program(&program)?;
+    let mut vm = VM::new();
+    vm.run(chunk)?;
+    Ok(())
 }
 
 /// 執行檔案，支援 import。
