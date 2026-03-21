@@ -1,16 +1,16 @@
 //! Lexer（詞法分析器）。
 //!
-//! 職責是把原始字串切成 token：
-//! `let x = 10;`
-//! ->
-//! `Let Ident("x") Assign IntLit(10) Semicolon`
+//! 它會把原始程式碼掃描成 token 序列，
+//! 並且記錄每個 token 的起始行列位置。
 
 use crate::error::{Result, TinyLangError};
-use crate::token::Token;
+use crate::token::{Span, SpannedToken, Token};
 
 pub struct Lexer {
     chars: Vec<char>,
     position: usize,
+    line: usize,
+    column: usize,
 }
 
 impl Lexer {
@@ -18,10 +18,19 @@ impl Lexer {
         Self {
             chars: input.chars().collect(),
             position: 0,
+            line: 1,
+            column: 1,
         }
     }
 
+    /// 只回傳 token，保留舊測試與公開 API 的易用性。
     pub fn tokenize(&mut self) -> Result<Vec<Token>> {
+        let spanned = self.tokenize_with_spans()?;
+        Ok(spanned.into_iter().map(|item| item.token).collect())
+    }
+
+    /// 給 parser 使用的版本，會保留位置資訊。
+    pub fn tokenize_with_spans(&mut self) -> Result<Vec<SpannedToken>> {
         let mut tokens = Vec::new();
 
         while let Some(ch) = self.peek() {
@@ -33,104 +42,84 @@ impl Lexer {
                 '0'..='9' => tokens.push(self.read_number()?),
                 '"' => tokens.push(self.read_string()?),
                 'a'..='z' | 'A'..='Z' | '_' => tokens.push(self.read_identifier_or_keyword()),
-                '+' => {
-                    self.advance();
-                    tokens.push(Token::Plus);
-                }
-                '-' => {
-                    self.advance();
-                    tokens.push(Token::Minus);
-                }
-                '*' => {
-                    self.advance();
-                    tokens.push(Token::Star);
-                }
-                '/' => {
-                    self.advance();
-                    tokens.push(Token::Slash);
-                }
-                '%' => {
-                    self.advance();
-                    tokens.push(Token::Percent);
-                }
-                '=' => {
-                    self.advance();
-                    if self.match_char('=') {
-                        tokens.push(Token::Eq);
-                    } else {
-                        tokens.push(Token::Assign);
-                    }
-                }
-                '!' => {
-                    self.advance();
-                    if self.match_char('=') {
-                        tokens.push(Token::Ne);
-                    } else {
-                        tokens.push(Token::Not);
-                    }
-                }
-                '<' => {
-                    self.advance();
-                    if self.match_char('=') {
-                        tokens.push(Token::Le);
-                    } else {
-                        tokens.push(Token::Lt);
-                    }
-                }
-                '>' => {
-                    self.advance();
-                    if self.match_char('=') {
-                        tokens.push(Token::Ge);
-                    } else {
-                        tokens.push(Token::Gt);
-                    }
-                }
+                '+' => tokens.push(self.single_char(Token::Plus)),
+                '-' => tokens.push(self.single_char(Token::Minus)),
+                '*' => tokens.push(self.single_char(Token::Star)),
+                '/' => tokens.push(self.single_char(Token::Slash)),
+                '%' => tokens.push(self.single_char(Token::Percent)),
+                '(' => tokens.push(self.single_char(Token::LParen)),
+                ')' => tokens.push(self.single_char(Token::RParen)),
+                '{' => tokens.push(self.single_char(Token::LBrace)),
+                '}' => tokens.push(self.single_char(Token::RBrace)),
+                '[' => tokens.push(self.single_char(Token::LBracket)),
+                ']' => tokens.push(self.single_char(Token::RBracket)),
+                ',' => tokens.push(self.single_char(Token::Comma)),
+                ';' => tokens.push(self.single_char(Token::Semicolon)),
+                '=' => tokens.push(self.read_two_char(Token::Assign, '=', Token::Eq)),
+                '!' => tokens.push(self.read_two_char(Token::Not, '=', Token::Ne)),
+                '<' => tokens.push(self.read_two_char(Token::Lt, '=', Token::Le)),
+                '>' => tokens.push(self.read_two_char(Token::Gt, '=', Token::Ge)),
                 '&' => {
+                    let span = self.current_span();
                     self.advance();
                     if self.match_char('&') {
-                        tokens.push(Token::And);
+                        tokens.push(SpannedToken {
+                            token: Token::And,
+                            span,
+                        });
                     } else {
-                        return Err(TinyLangError::Lex("單一 '&' 不合法，請使用 &&".into()));
+                        return Err(TinyLangError::lex(
+                            "single '&' is not valid, use &&",
+                            span,
+                        ));
                     }
                 }
                 '|' => {
+                    let span = self.current_span();
                     self.advance();
                     if self.match_char('|') {
-                        tokens.push(Token::Or);
+                        tokens.push(SpannedToken {
+                            token: Token::Or,
+                            span,
+                        });
                     } else {
-                        return Err(TinyLangError::Lex("單一 '|' 不合法，請使用 ||".into()));
+                        return Err(TinyLangError::lex(
+                            "single '|' is not valid, use ||",
+                            span,
+                        ));
                     }
                 }
-                '(' => {
-                    self.advance();
-                    tokens.push(Token::LParen);
+                _ => {
+                    return Err(TinyLangError::lex(
+                        format!("unrecognized character '{ch}'"),
+                        self.current_span(),
+                    ));
                 }
-                ')' => {
-                    self.advance();
-                    tokens.push(Token::RParen);
-                }
-                '{' => {
-                    self.advance();
-                    tokens.push(Token::LBrace);
-                }
-                '}' => {
-                    self.advance();
-                    tokens.push(Token::RBrace);
-                }
-                ',' => {
-                    self.advance();
-                    tokens.push(Token::Comma);
-                }
-                ';' => {
-                    self.advance();
-                    tokens.push(Token::Semicolon);
-                }
-                _ => return Err(TinyLangError::Lex(format!("無法辨識的字元: '{ch}'"))),
             }
         }
 
-        tokens.push(Token::Eof);
+        tokens.push(SpannedToken {
+            token: Token::Eof,
+            span: self.current_span(),
+        });
         Ok(tokens)
+    }
+
+    fn single_char(&mut self, token: Token) -> SpannedToken {
+        let span = self.current_span();
+        self.advance();
+        SpannedToken { token, span }
+    }
+
+    fn read_two_char(&mut self, one: Token, expected: char, two: Token) -> SpannedToken {
+        let span = self.current_span();
+        self.advance();
+        let token = if self.match_char(expected) { two } else { one };
+        SpannedToken { token, span }
+    }
+
+    fn current_span(&self) -> Span {
+        Span::new(self.line, self.column)
     }
 
     fn peek(&self) -> Option<char> {
@@ -142,16 +131,20 @@ impl Lexer {
     }
 
     fn advance(&mut self) -> Option<char> {
-        let ch = self.peek();
-        if ch.is_some() {
-            self.position += 1;
+        let ch = self.peek()?;
+        self.position += 1;
+        if ch == '\n' {
+            self.line += 1;
+            self.column = 1;
+        } else {
+            self.column += 1;
         }
-        ch
+        Some(ch)
     }
 
     fn match_char(&mut self, expected: char) -> bool {
         if self.peek() == Some(expected) {
-            self.position += 1;
+            self.advance();
             true
         } else {
             false
@@ -167,20 +160,27 @@ impl Lexer {
         }
     }
 
-    fn read_number(&mut self) -> Result<Token> {
+    fn read_number(&mut self) -> Result<SpannedToken> {
+        let span = self.current_span();
         let start = self.position;
+
         while matches!(self.peek(), Some('0'..='9')) {
             self.advance();
         }
 
         let number_str: String = self.chars[start..self.position].iter().collect();
-        let value = number_str.parse::<i64>().map_err(|err| {
-            TinyLangError::Lex(format!("整數解析失敗 '{number_str}': {err}"))
-        })?;
-        Ok(Token::IntLit(value))
+        let value = number_str
+            .parse::<i64>()
+            .map_err(|err| TinyLangError::lex(format!("invalid integer '{number_str}': {err}"), span))?;
+
+        Ok(SpannedToken {
+            token: Token::IntLit(value),
+            span,
+        })
     }
 
-    fn read_string(&mut self) -> Result<Token> {
+    fn read_string(&mut self) -> Result<SpannedToken> {
+        let span = self.current_span();
         self.advance();
         let mut value = String::new();
 
@@ -188,13 +188,16 @@ impl Lexer {
             match ch {
                 '"' => {
                     self.advance();
-                    return Ok(Token::StringLit(value));
+                    return Ok(SpannedToken {
+                        token: Token::StringLit(value),
+                        span,
+                    });
                 }
                 '\\' => {
                     self.advance();
                     let escaped = self
                         .advance()
-                        .ok_or_else(|| TinyLangError::Lex("字串跳脫字元不完整".into()))?;
+                        .ok_or_else(|| TinyLangError::lex("unterminated escape sequence", span))?;
                     let actual = match escaped {
                         'n' => '\n',
                         't' => '\t',
@@ -211,17 +214,19 @@ impl Lexer {
             }
         }
 
-        Err(TinyLangError::Lex("字串缺少結尾雙引號".into()))
+        Err(TinyLangError::lex("unterminated string literal", span))
     }
 
-    fn read_identifier_or_keyword(&mut self) -> Token {
+    fn read_identifier_or_keyword(&mut self) -> SpannedToken {
+        let span = self.current_span();
         let start = self.position;
+
         while matches!(self.peek(), Some('a'..='z' | 'A'..='Z' | '0'..='9' | '_')) {
             self.advance();
         }
 
         let ident: String = self.chars[start..self.position].iter().collect();
-        match ident.as_str() {
+        let token = match ident.as_str() {
             "let" => Token::Let,
             "fn" => Token::Fn,
             "return" => Token::Return,
@@ -232,6 +237,8 @@ impl Lexer {
             "true" => Token::BoolLit(true),
             "false" => Token::BoolLit(false),
             _ => Token::Ident(ident),
-        }
+        };
+
+        SpannedToken { token, span }
     }
 }

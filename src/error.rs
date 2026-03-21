@@ -1,25 +1,92 @@
 //! 專案共用錯誤型別。
 //!
-//! 讓 lexer / parser / interpreter 都用同一個錯誤入口，
-//! API 會比較乾淨，也比較容易測試。
+//! Phase 2 把錯誤提升成統一結構：
+//! - 錯誤種類
+//! - 訊息
+//! - 可選的行號 / 列號
 
 use std::fmt::{Display, Formatter};
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum TinyLangError {
-    Lex(String),
-    Parse(String),
-    Runtime(String),
-    Io(String),
+use crate::token::Span;
+
+/// 錯誤分類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    Lex,
+    Parse,
+    Runtime,
+    Io,
+}
+
+/// tiny-lang 統一錯誤。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TinyLangError {
+    pub kind: ErrorKind,
+    pub message: String,
+    pub span: Option<Span>,
+}
+
+impl TinyLangError {
+    pub fn lex(message: impl Into<String>, span: Span) -> Self {
+        Self {
+            kind: ErrorKind::Lex,
+            message: message.into(),
+            span: Some(span),
+        }
+    }
+
+    pub fn parse(message: impl Into<String>, span: Span) -> Self {
+        Self {
+            kind: ErrorKind::Parse,
+            message: message.into(),
+            span: Some(span),
+        }
+    }
+
+    pub fn runtime(message: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::Runtime,
+            message: message.into(),
+            span: None,
+        }
+    }
+
+    pub fn io(message: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::Io,
+            message: message.into(),
+            span: None,
+        }
+    }
+
+    pub fn with_span(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
+    }
+
+    fn kind_label(&self) -> &'static str {
+        match self.kind {
+            ErrorKind::Lex => "Lexer",
+            ErrorKind::Parse => "Parser",
+            ErrorKind::Runtime => "Runtime",
+            ErrorKind::Io => "IO",
+        }
+    }
 }
 
 impl Display for TinyLangError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TinyLangError::Lex(message) => write!(f, "Lexer error: {message}"),
-            TinyLangError::Parse(message) => write!(f, "Parser error: {message}"),
-            TinyLangError::Runtime(message) => write!(f, "Runtime error: {message}"),
-            TinyLangError::Io(message) => write!(f, "IO error: {message}"),
+        if let Some(span) = self.span {
+            write!(
+                f,
+                "[line {}, col {}] {} error: {}",
+                span.line,
+                span.column,
+                self.kind_label(),
+                self.message
+            )
+        } else {
+            write!(f, "{} error: {}", self.kind_label(), self.message)
         }
     }
 }
@@ -28,7 +95,7 @@ impl std::error::Error for TinyLangError {}
 
 impl From<std::io::Error> for TinyLangError {
     fn from(value: std::io::Error) -> Self {
-        TinyLangError::Io(value.to_string())
+        TinyLangError::io(value.to_string())
     }
 }
 

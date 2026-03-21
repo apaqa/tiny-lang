@@ -75,10 +75,12 @@ fn tokenize_comments_and_comparisons() {
 
 #[test]
 fn tokenize_string_and_number() {
-    let source = r#"print("hello"); let value = 12345;"#;
+    let source = r#"print("hello"); let value = [12345];"#;
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize().unwrap();
 
     assert!(tokens.contains(&Token::StringLit("hello".into())));
     assert!(tokens.contains(&Token::IntLit(12345)));
+    assert!(tokens.contains(&Token::LBracket));
+    assert!(tokens.contains(&Token::RBracket));
 }

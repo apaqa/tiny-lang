@@ -1,16 +1,18 @@
 //! AST（抽象語法樹）定義。
 //!
-//! AST 是把程式從字串轉成「樹狀結構」後的表示法，
-//! 後面的直譯器就可以直接沿著這棵樹執行。
+//! AST 是 parser 輸出的樹狀結構。
+//! interpreter 不需要再面對原始字串，
+//! 只要沿著 AST 節點逐步執行即可。
 
-/// 一份程式就是多個 statement。
+/// 一份程式就是一串 statement。
 pub type Program = Vec<Statement>;
 
-/// 會改變程式狀態的語法單位。
+/// 陳述式。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     LetDecl { name: String, value: Expr },
     Assignment { name: String, value: Expr },
+    IndexAssignment { array: String, index: Expr, value: Expr },
     FnDecl {
         name: String,
         params: Vec<String>,
@@ -30,13 +32,18 @@ pub enum Statement {
     ExprStatement(Expr),
 }
 
-/// 會產生值的語法單位。
+/// 表達式。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     IntLit(i64),
     StringLit(String),
     BoolLit(bool),
     Ident(String),
+    ArrayLit(Vec<Expr>),
+    IndexAccess {
+        array: Box<Expr>,
+        index: Box<Expr>,
+    },
     BinaryOp {
         left: Box<Expr>,
         op: BinaryOperator,

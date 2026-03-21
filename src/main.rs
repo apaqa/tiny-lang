@@ -24,9 +24,7 @@ fn run() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() > 2 {
-        return Err(TinyLangError::Io(
-            "用法：cargo run -- [file.tiny]".into(),
-        ));
+        return Err(TinyLangError::io("用法：cargo run -- [file.tiny]"));
     }
 
     if let Some(path) = args.get(1) {

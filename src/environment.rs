@@ -1,7 +1,7 @@
 //! Environment（執行期作用域）。
 //!
-//! 使用 HashMap 儲存當前 scope 的值，
-//! 並用 parent 鏈往外查找。
+//! 這裡管理變數與函式的查找。
+//! Phase 2 的陣列是可變資料，因此會用共享所有權保存。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -10,19 +10,39 @@ use std::rc::Rc;
 use crate::ast::Statement;
 use crate::error::{Result, TinyLangError};
 
-#[derive(Debug, Clone, PartialEq)]
+/// 陣列的共享表示。
+pub type ArrayRef = Rc<RefCell<Vec<Value>>>;
+
+/// 執行期值。
+#[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
     String(String),
     Bool(bool),
+    Array(ArrayRef),
     Function(FunctionValue),
+    Builtin(BuiltinFunction),
     Null,
 }
 
+/// 使用者定義函式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionValue {
+    pub name: String,
     pub params: Vec<String>,
     pub body: Vec<Statement>,
+}
+
+/// 內建函式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinFunction {
+    Len,
+    Push,
+    Pop,
+    Str,
+    Int,
+    TypeOf,
+    Input,
 }
 
 pub type EnvRef = Rc<RefCell<Environment>>;
@@ -61,7 +81,9 @@ impl Environment {
             return parent.borrow().get(name);
         }
 
-        Err(TinyLangError::Runtime(format!("未定義的識別字: {name}")))
+        Err(TinyLangError::runtime(format!(
+            "Variable '{name}' not defined"
+        )))
     }
 
     pub fn assign(&mut self, name: &str, value: Value) -> Result<()> {
@@ -74,8 +96,8 @@ impl Environment {
             return parent.borrow_mut().assign(name, value);
         }
 
-        Err(TinyLangError::Runtime(format!(
-            "不能指派給未宣告的變數: {name}"
+        Err(TinyLangError::runtime(format!(
+            "Variable '{name}' not defined"
         )))
     }
 }
@@ -86,11 +108,51 @@ impl Value {
             Value::Bool(value) => *value,
             Value::Int(value) => *value != 0,
             Value::String(value) => !value.is_empty(),
-            Value::Function(_) => true,
+            Value::Array(items) => !items.borrow().is_empty(),
+            Value::Function(_) | Value::Builtin(_) => true,
             Value::Null => false,
         }
     }
+
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::Int(_) => "Int",
+            Value::String(_) => "String",
+            Value::Bool(_) => "Bool",
+            Value::Array(_) => "Array",
+            Value::Function(_) | Value::Builtin(_) => "Function",
+            Value::Null => "Null",
+        }
+    }
+
+    pub fn type_name_for_builtin(&self) -> &'static str {
+        match self {
+            Value::Int(_) => "int",
+            Value::String(_) => "string",
+            Value::Bool(_) => "bool",
+            Value::Array(_) => "array",
+            Value::Function(_) | Value::Builtin(_) => "function",
+            Value::Null => "null",
+        }
+    }
 }
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Null, Value::Null) => true,
+            (Value::Array(a), Value::Array(b)) => *a.borrow() == *b.borrow(),
+            (Value::Builtin(a), Value::Builtin(b)) => a == b,
+            (Value::Function(a), Value::Function(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
 
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -98,7 +160,17 @@ impl std::fmt::Display for Value {
             Value::Int(value) => write!(f, "{value}"),
             Value::String(value) => write!(f, "{value}"),
             Value::Bool(value) => write!(f, "{value}"),
-            Value::Function(_) => write!(f, "<fn>"),
+            Value::Array(items) => {
+                let rendered = items
+                    .borrow()
+                    .iter()
+                    .map(|item| item.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "[{rendered}]")
+            }
+            Value::Function(function) => write!(f, "<fn {}>", function.name),
+            Value::Builtin(_) => write!(f, "<builtin>"),
             Value::Null => write!(f, "null"),
         }
     }
