@@ -1,9 +1,6 @@
-//! 抽象語法樹（AST）定義。
-//!
-//! parser 會把 token 流轉成 AST，
-//! interpreter 與之後的 compiler 會基於這些節點工作。
+//! AST 定義。
 
-/// 整份 tiny-lang 程式。
+/// tiny-lang 程式。
 pub type Program = Vec<Statement>;
 
 /// 型別註記。
@@ -19,7 +16,6 @@ pub enum TypeAnnotation {
 }
 
 impl TypeAnnotation {
-    /// 轉成人類可讀的型別名稱，用於錯誤訊息。
     pub fn display_name(&self) -> String {
         match self {
             TypeAnnotation::Int => "int".into(),
@@ -33,13 +29,24 @@ impl TypeAnnotation {
     }
 }
 
-/// 陳述式節點。
+/// enum variant AST。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumVariant {
+    pub name: String,
+    pub fields: Option<Vec<(String, Option<TypeAnnotation>)>>,
+}
+
+/// 陳述式。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Import { path: String },
     StructDecl {
         name: String,
         fields: Vec<(String, Option<TypeAnnotation>)>,
+    },
+    EnumDecl {
+        name: String,
+        variants: Vec<EnumVariant>,
     },
     LetDecl {
         name: String,
@@ -103,7 +110,7 @@ pub enum Statement {
     ExprStatement(Expr),
 }
 
-/// 表達式節點。
+/// 表達式。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     IntLit(i64),
@@ -113,6 +120,11 @@ pub enum Expr {
     StructInit {
         name: String,
         fields: Vec<(String, Expr)>,
+    },
+    EnumVariant {
+        enum_name: String,
+        variant: String,
+        fields: Option<Vec<(String, Expr)>>,
     },
     ArrayLit(Vec<Expr>),
     MapLit(Vec<(Expr, Expr)>),
@@ -150,13 +162,18 @@ pub struct MatchArm {
     pub body: Vec<Statement>,
 }
 
-/// match 使用的 pattern。
+/// match pattern。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     IntLit(i64),
     StringLit(String),
     BoolLit(bool),
     Ident(String),
+    EnumVariant {
+        enum_name: String,
+        variant: String,
+        bindings: Option<Vec<String>>,
+    },
     Wildcard,
 }
 

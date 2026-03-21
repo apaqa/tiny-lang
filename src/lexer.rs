@@ -1,4 +1,4 @@
-//! Lexer：把原始碼切成 token。
+//! Lexer。
 
 use crate::error::{Result, TinyLangError};
 use crate::token::{Span, SpannedToken, Token};
@@ -20,13 +20,11 @@ impl Lexer {
         }
     }
 
-    /// 只回傳 token，不帶位置。
     pub fn tokenize(&mut self) -> Result<Vec<Token>> {
         let spanned = self.tokenize_with_spans()?;
         Ok(spanned.into_iter().map(|item| item.token).collect())
     }
 
-    /// 回傳帶位置資訊的 token 流。
     pub fn tokenize_with_spans(&mut self) -> Result<Vec<SpannedToken>> {
         let mut tokens = Vec::new();
 
@@ -52,7 +50,7 @@ impl Lexer {
                 ']' => tokens.push(self.single_char(Token::RBracket)),
                 ',' => tokens.push(self.single_char(Token::Comma)),
                 ';' => tokens.push(self.single_char(Token::Semicolon)),
-                ':' => tokens.push(self.single_char(Token::Colon)),
+                ':' => tokens.push(self.read_colon_or_colon_colon()),
                 '.' => tokens.push(self.single_char(Token::Dot)),
                 '=' => tokens.push(self.read_equals_assign_or_fat_arrow()),
                 '!' => tokens.push(self.read_two_char(Token::Not, '=', Token::Ne)),
@@ -116,6 +114,17 @@ impl Lexer {
             Token::Arrow
         } else {
             Token::Minus
+        };
+        SpannedToken { token, span }
+    }
+
+    fn read_colon_or_colon_colon(&mut self) -> SpannedToken {
+        let span = self.current_span();
+        self.advance();
+        let token = if self.match_char(':') {
+            Token::ColonColon
+        } else {
+            Token::Colon
         };
         SpannedToken { token, span }
     }
@@ -245,6 +254,7 @@ impl Lexer {
             "let" => Token::Let,
             "fn" => Token::Fn,
             "struct" => Token::Struct,
+            "enum" => Token::Enum,
             "new" => Token::New,
             "match" => Token::Match,
             "return" => Token::Return,

@@ -1,7 +1,7 @@
-//! Parser：把 token 流轉成 AST。
+//! Parser。
 
 use crate::ast::{
-    BinaryOperator, Expr, MatchArm, Pattern, Program, Statement, TypeAnnotation, UnaryOperator,
+    BinaryOperator, EnumVariant, Expr, MatchArm, Pattern, Program, Statement, TypeAnnotation, UnaryOperator,
 };
 use crate::error::{Result, TinyLangError};
 use crate::token::{SpannedToken, Token};
@@ -33,6 +33,7 @@ impl Parser {
         match &self.peek().token {
             Token::Import => self.parse_import_stmt(),
             Token::Struct => self.parse_struct_decl(),
+            Token::Enum => self.parse_enum_decl(),
             Token::Let => self.parse_let_decl(),
             Token::Fn => self.parse_fn_or_method_decl(),
             Token::Return => self.parse_return_stmt(),
@@ -79,6 +80,44 @@ impl Parser {
         }
         self.expect_token(Token::RBrace)?;
         Ok(Statement::StructDecl { name, fields })
+    }
+
+    fn parse_enum_decl(&mut self) -> Result<Statement> {
+        self.expect_token(Token::Enum)?;
+        let name = self.consume_ident()?;
+        self.expect_token(Token::LBrace)?;
+        let mut variants = Vec::new();
+        while !self.check(&Token::RBrace) && !self.is_at_end() {
+            let variant_name = self.consume_ident()?;
+            let fields = if self.match_token(&Token::LBrace) {
+                let mut fields = Vec::new();
+                if !self.check(&Token::RBrace) {
+                    loop {
+                        let field_name = self.consume_ident()?;
+                        let annotation = if self.match_token(&Token::Colon) {
+                            Some(self.parse_type_annotation()?)
+                        } else {
+                            None
+                        };
+                        fields.push((field_name, annotation));
+                        if !self.match_token(&Token::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect_token(Token::RBrace)?;
+                Some(fields)
+            } else {
+                None
+            };
+            variants.push(EnumVariant {
+                name: variant_name,
+                fields,
+            });
+            self.match_token(&Token::Comma);
+        }
+        self.expect_token(Token::RBrace)?;
+        Ok(Statement::EnumDecl { name, variants })
     }
 
     fn parse_let_decl(&mut self) -> Result<Statement> {
@@ -232,6 +271,29 @@ impl Parser {
             Token::True => Ok(Pattern::BoolLit(true)),
             Token::False => Ok(Pattern::BoolLit(false)),
             Token::Ident(name) if name == "_" => Ok(Pattern::Wildcard),
+            Token::Ident(enum_name) if self.match_token(&Token::ColonColon) => {
+                let variant = self.consume_ident()?;
+                let bindings = if self.match_token(&Token::LBrace) {
+                    let mut fields = Vec::new();
+                    if !self.check(&Token::RBrace) {
+                        loop {
+                            fields.push(self.consume_ident()?);
+                            if !self.match_token(&Token::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect_token(Token::RBrace)?;
+                    Some(fields)
+                } else {
+                    None
+                };
+                Ok(Pattern::EnumVariant {
+                    enum_name,
+                    variant,
+                    bindings,
+                })
+            }
             Token::Ident(name) => Ok(Pattern::Ident(name)),
             other => Err(TinyLangError::parse(
                 format!("unexpected token in match pattern: {other:?}"),
@@ -521,6 +583,9 @@ impl Parser {
                     Token::True => Ok(Expr::BoolLit(true)),
                     Token::False => Ok(Expr::BoolLit(false)),
                     Token::Ident(name) => {
+                        if self.match_token(&Token::ColonColon) {
+                            return self.parse_enum_variant_after_name(name);
+                        }
                         if self.allow_struct_init && self.check(&Token::LBrace) {
                             self.parse_struct_init_after_name(name)
                         } else {
@@ -541,6 +606,33 @@ impl Parser {
                 }
             }
         }
+    }
+
+    fn parse_enum_variant_after_name(&mut self, enum_name: String) -> Result<Expr> {
+        let variant = self.consume_ident()?;
+        let fields = if self.match_token(&Token::LBrace) {
+            let mut fields = Vec::new();
+            if !self.check(&Token::RBrace) {
+                loop {
+                    let field_name = self.consume_ident()?;
+                    self.expect_token(Token::Colon)?;
+                    let value = self.parse_expression()?;
+                    fields.push((field_name, value));
+                    if !self.match_token(&Token::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect_token(Token::RBrace)?;
+            Some(fields)
+        } else {
+            None
+        };
+        Ok(Expr::EnumVariant {
+            enum_name,
+            variant,
+            fields,
+        })
     }
 
     fn parse_new_struct_init(&mut self) -> Result<Expr> {

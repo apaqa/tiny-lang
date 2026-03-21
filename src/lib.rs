@@ -4,6 +4,7 @@ pub mod ast;
 pub mod compiler;
 pub mod environment;
 pub mod error;
+pub mod gc;
 pub mod interpreter;
 pub mod lexer;
 pub mod parser;

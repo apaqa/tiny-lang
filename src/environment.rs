@@ -1,7 +1,4 @@
-//! 執行環境與執行期值定義。
-//!
-//! tree-walking interpreter 與 bytecode VM 會共用大部分執行期值，
-//! 這裡集中管理 Value、函式、struct 定義與詞法環境。
+//! 執行期值與環境定義。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -10,25 +7,22 @@ use std::rc::Rc;
 use crate::ast::{Statement, TypeAnnotation};
 use crate::compiler::Chunk;
 use crate::error::{Result, TinyLangError};
-
-/// Array 的共享引用。
-pub type ArrayRef = Rc<RefCell<Vec<Value>>>;
-
-/// Map 的共享引用。
-pub type MapRef = Rc<RefCell<HashMap<String, Value>>>;
-
-/// Struct instance 欄位表的共享引用。
-pub type StructFieldsRef = Rc<RefCell<HashMap<String, Value>>>;
+use crate::gc::{
+    ClosureObject, EnumVariantObject, GcArrayRef, GcClosureRef, GcEnumVariantRef, GcHeap, GcMapRef, GcStringRef,
+    GcStructRef, StructInstanceObject,
+};
 
 /// 執行期值。
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
-    String(String),
+    String(GcStringRef),
     Bool(bool),
-    Array(ArrayRef),
-    Map(MapRef),
-    StructInstance(StructInstanceValue),
+    Array(GcArrayRef),
+    Map(GcMapRef),
+    Closure(GcClosureRef),
+    StructInstance(GcStructRef),
+    EnumVariant(GcEnumVariantRef),
     Function(FunctionValue),
     BoundMethod(BoundMethodValue),
     CompiledFunction(Rc<CompiledFunction>),
@@ -38,14 +32,14 @@ pub enum Value {
     Null,
 }
 
-/// 變數綁定，包含值與可選型別註記。
+/// 變數綁定與型別註記。
 #[derive(Debug, Clone)]
 pub struct Binding {
     pub value: Value,
     pub type_annotation: Option<TypeAnnotation>,
 }
 
-/// tree-walking interpreter 使用的函式表示。
+/// tree-walking interpreter 使用的函式值。
 #[derive(Debug, Clone)]
 pub struct FunctionValue {
     pub name: Option<String>,
@@ -55,28 +49,28 @@ pub struct FunctionValue {
     pub closure: EnvRef,
 }
 
-/// Struct 定義。
+/// struct 定義。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructDef {
     pub name: String,
     pub fields: Vec<(String, Option<TypeAnnotation>)>,
 }
 
-/// 執行期 struct instance。
-#[derive(Debug, Clone)]
+/// 與舊程式碼相容的 struct instance 快照。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructInstanceValue {
     pub type_name: String,
-    pub fields: StructFieldsRef,
+    pub fields: HashMap<String, Value>,
 }
 
-/// tree-walking interpreter 綁定 receiver 後的方法值。
+/// tree-walking interpreter 的 bound method。
 #[derive(Debug, Clone)]
 pub struct BoundMethodValue {
-    pub receiver: StructInstanceValue,
+    pub receiver: GcStructRef,
     pub method: FunctionValue,
 }
 
-/// bytecode VM 使用的已編譯函式。
+/// bytecode VM 使用的函式原型。
 #[derive(Debug, Clone)]
 pub struct CompiledFunction {
     pub name: Option<String>,
@@ -85,6 +79,7 @@ pub struct CompiledFunction {
     pub chunk: Rc<Chunk>,
     pub local_count: usize,
     pub takes_self: bool,
+    pub capture_names: Vec<String>,
 }
 
 impl CompiledFunction {
@@ -93,7 +88,7 @@ impl CompiledFunction {
     }
 }
 
-/// VM 的原生函式值。
+/// VM 內建函式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeFunction {
     Len,
@@ -105,14 +100,14 @@ pub enum NativeFunction {
     Range,
 }
 
-/// VM 綁定 receiver 後的方法值。
+/// VM 的 bound method。
 #[derive(Debug, Clone)]
 pub struct VmBoundMethodValue {
-    pub receiver: StructInstanceValue,
+    pub receiver: GcStructRef,
     pub method: Rc<CompiledFunction>,
 }
 
-/// tree interpreter 的內建函式表。
+/// tree interpreter 的內建函式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinFunction {
     Len,
@@ -145,13 +140,28 @@ pub enum BuiltinFunction {
     Assert,
 }
 
+/// enum variant 定義。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumVariantDef {
+    pub name: String,
+    pub fields: Option<Vec<(String, Option<TypeAnnotation>)>>,
+}
+
+/// enum 定義。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<EnumVariantDef>,
+}
+
 pub type EnvRef = Rc<RefCell<Environment>>;
 
-/// 環境同時保存變數、struct 定義與 method 定義。
+/// 執行環境。
 #[derive(Debug, Clone)]
 pub struct Environment {
     values: HashMap<String, Binding>,
     structs: HashMap<String, StructDef>,
+    enums: HashMap<String, EnumDef>,
     methods: HashMap<String, HashMap<String, FunctionValue>>,
     parent: Option<EnvRef>,
 }
@@ -161,6 +171,7 @@ impl Environment {
         Rc::new(RefCell::new(Self {
             values: HashMap::new(),
             structs: HashMap::new(),
+            enums: HashMap::new(),
             methods: HashMap::new(),
             parent: None,
         }))
@@ -170,6 +181,7 @@ impl Environment {
         Rc::new(RefCell::new(Self {
             values: HashMap::new(),
             structs: HashMap::new(),
+            enums: HashMap::new(),
             methods: HashMap::new(),
             parent: Some(parent),
         }))
@@ -193,11 +205,9 @@ impl Environment {
         if let Some(binding) = self.values.get(name) {
             return Ok(binding.value.clone());
         }
-
         if let Some(parent) = &self.parent {
             return parent.borrow().get(name);
         }
-
         Err(TinyLangError::runtime(format!("Variable '{name}' not defined")))
     }
 
@@ -206,11 +216,9 @@ impl Environment {
             binding.value = value;
             return Ok(());
         }
-
         if let Some(parent) = &self.parent {
             return parent.borrow_mut().assign(name, value);
         }
-
         Err(TinyLangError::runtime(format!("Variable '{name}' not defined")))
     }
 
@@ -218,11 +226,9 @@ impl Environment {
         if let Some(binding) = self.values.get(name) {
             return Ok(binding.type_annotation.clone());
         }
-
         if let Some(parent) = &self.parent {
             return parent.borrow().get_annotation(name);
         }
-
         Err(TinyLangError::runtime(format!("Variable '{name}' not defined")))
     }
 
@@ -234,19 +240,28 @@ impl Environment {
         if let Some(def) = self.structs.get(name) {
             return Ok(def.clone());
         }
-
         if let Some(parent) = &self.parent {
             return parent.borrow().get_struct(name);
         }
-
         Err(TinyLangError::runtime(format!("Struct '{name}' not defined")))
     }
 
+    pub fn define_enum(&mut self, name: String, def: EnumDef) {
+        self.enums.insert(name, def);
+    }
+
+    pub fn get_enum(&self, name: &str) -> Result<EnumDef> {
+        if let Some(def) = self.enums.get(name) {
+            return Ok(def.clone());
+        }
+        if let Some(parent) = &self.parent {
+            return parent.borrow().get_enum(name);
+        }
+        Err(TinyLangError::runtime(format!("Enum '{name}' not defined")))
+    }
+
     pub fn define_method(&mut self, struct_name: String, method_name: String, method: FunctionValue) {
-        self.methods
-            .entry(struct_name)
-            .or_default()
-            .insert(method_name, method);
+        self.methods.entry(struct_name).or_default().insert(method_name, method);
     }
 
     pub fn get_method(&self, struct_name: &str, method_name: &str) -> Result<FunctionValue> {
@@ -255,11 +270,9 @@ impl Environment {
                 return Ok(method.clone());
             }
         }
-
         if let Some(parent) = &self.parent {
             return parent.borrow().get_method(struct_name, method_name);
         }
-
         Err(TinyLangError::runtime(format!(
             "Method '{}.{}' not defined",
             struct_name, method_name
@@ -272,17 +285,8 @@ impl Value {
         match self {
             Value::Bool(value) => *value,
             Value::Int(value) => *value != 0,
-            Value::String(value) => !value.is_empty(),
-            Value::Array(items) => !items.borrow().is_empty(),
-            Value::Map(items) => !items.borrow().is_empty(),
-            Value::StructInstance(_) => true,
-            Value::Function(_)
-            | Value::BoundMethod(_)
-            | Value::CompiledFunction(_)
-            | Value::NativeFunction(_)
-            | Value::VmBoundMethod(_)
-            | Value::Builtin(_) => true,
             Value::Null => false,
+            _ => true,
         }
     }
 
@@ -293,7 +297,9 @@ impl Value {
             Value::Bool(_) => "Bool",
             Value::Array(_) => "Array",
             Value::Map(_) => "Map",
+            Value::Closure(_) => "Closure",
             Value::StructInstance(_) => "Struct",
+            Value::EnumVariant(_) => "Enum",
             Value::Function(_)
             | Value::BoundMethod(_)
             | Value::CompiledFunction(_)
@@ -311,7 +317,9 @@ impl Value {
             Value::Bool(_) => "bool".into(),
             Value::Array(_) => "array".into(),
             Value::Map(_) => "map".into(),
-            Value::StructInstance(instance) => instance.type_name.clone(),
+            Value::Closure(_) => "function".into(),
+            Value::StructInstance(_) => "struct".into(),
+            Value::EnumVariant(_) => "enum".into(),
             Value::Function(_)
             | Value::BoundMethod(_)
             | Value::CompiledFunction(_)
@@ -322,29 +330,16 @@ impl Value {
         }
     }
 
-    /// 給錯誤訊息使用的型別名稱。
     pub fn type_name_for_error(&self) -> String {
         match self {
             Value::Int(_) => "int".into(),
             Value::String(_) => "str".into(),
             Value::Bool(_) => "bool".into(),
-            Value::Array(items) => {
-                let items = items.borrow();
-                if let Some(first) = items.first() {
-                    format!("[{}]", first.type_name_for_error())
-                } else {
-                    "[any]".into()
-                }
-            }
-            Value::Map(items) => {
-                let items = items.borrow();
-                if let Some(first) = items.values().next() {
-                    format!("{{{}}}", first.type_name_for_error())
-                } else {
-                    "{any}".into()
-                }
-            }
-            Value::StructInstance(instance) => instance.type_name.clone(),
+            Value::Array(_) => "array".into(),
+            Value::Map(_) => "map".into(),
+            Value::Closure(_) => "function".into(),
+            Value::StructInstance(_) => "struct".into(),
+            Value::EnumVariant(_) => "enum".into(),
             Value::Function(_)
             | Value::BoundMethod(_)
             | Value::CompiledFunction(_)
@@ -367,14 +362,6 @@ impl PartialEq for FunctionValue {
 
 impl Eq for FunctionValue {}
 
-impl PartialEq for StructInstanceValue {
-    fn eq(&self, other: &Self) -> bool {
-        self.type_name == other.type_name && *self.fields.borrow() == *other.fields.borrow()
-    }
-}
-
-impl Eq for StructInstanceValue {}
-
 impl PartialEq for BoundMethodValue {
     fn eq(&self, other: &Self) -> bool {
         self.receiver == other.receiver && self.method == other.method
@@ -390,6 +377,7 @@ impl PartialEq for CompiledFunction {
             && self.return_type == other.return_type
             && self.local_count == other.local_count
             && self.takes_self == other.takes_self
+            && self.capture_names == other.capture_names
             && self.chunk == other.chunk
     }
 }
@@ -410,16 +398,18 @@ impl PartialEq for Value {
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Null, Value::Null) => true,
-            (Value::Array(a), Value::Array(b)) => *a.borrow() == *b.borrow(),
-            (Value::Map(a), Value::Map(b)) => *a.borrow() == *b.borrow(),
+            (Value::Array(a), Value::Array(b)) => a == b,
+            (Value::Map(a), Value::Map(b)) => a == b,
+            (Value::Closure(a), Value::Closure(b)) => a == b,
             (Value::StructInstance(a), Value::StructInstance(b)) => a == b,
+            (Value::EnumVariant(a), Value::EnumVariant(b)) => a == b,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Function(a), Value::Function(b)) => a == b,
             (Value::BoundMethod(a), Value::BoundMethod(b)) => a == b,
             (Value::CompiledFunction(a), Value::CompiledFunction(b)) => a == b,
             (Value::NativeFunction(a), Value::NativeFunction(b)) => a == b,
             (Value::VmBoundMethod(a), Value::VmBoundMethod(b)) => a == b,
+            (Value::Null, Value::Null) => true,
             _ => false,
         }
     }
@@ -431,36 +421,13 @@ impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::Int(value) => write!(f, "{value}"),
-            Value::String(value) => write!(f, "{value}"),
+            Value::String(_) => write!(f, "<string>"),
             Value::Bool(value) => write!(f, "{value}"),
-            Value::Array(items) => {
-                let rendered = items
-                    .borrow()
-                    .iter()
-                    .map(|item| item.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                write!(f, "[{rendered}]")
-            }
-            Value::Map(items) => {
-                let mut entries = items
-                    .borrow()
-                    .iter()
-                    .map(|(key, value)| format!("\"{key}\": {value}"))
-                    .collect::<Vec<_>>();
-                entries.sort();
-                write!(f, "{{{}}}", entries.join(", "))
-            }
-            Value::StructInstance(instance) => {
-                let mut entries = instance
-                    .fields
-                    .borrow()
-                    .iter()
-                    .map(|(key, value)| format!("{key}: {value}"))
-                    .collect::<Vec<_>>();
-                entries.sort();
-                write!(f, "{} {{ {} }}", instance.type_name, entries.join(", "))
-            }
+            Value::Array(_) => write!(f, "<array>"),
+            Value::Map(_) => write!(f, "<map>"),
+            Value::Closure(_) => write!(f, "<closure>"),
+            Value::StructInstance(_) => write!(f, "<struct>"),
+            Value::EnumVariant(_) => write!(f, "<enum-variant>"),
             Value::Function(function) => match &function.name {
                 Some(name) => write!(f, "<fn {name}>"),
                 None => write!(f, "<lambda>"),
@@ -482,6 +449,130 @@ impl std::fmt::Display for Value {
             Value::Null => write!(f, "null"),
         }
     }
+}
+
+/// 將值轉成可讀字串。
+pub fn render_value(heap: &GcHeap, value: &Value) -> String {
+    match value {
+        Value::Int(value) => value.to_string(),
+        Value::String(reference) => heap.get_string(reference),
+        Value::Bool(value) => value.to_string(),
+        Value::Array(reference) => {
+            let rendered = heap.with_array(reference, |items| {
+                items
+                    .iter()
+                    .map(|item| render_value(heap, item))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            format!("[{rendered}]")
+        }
+        Value::Map(reference) => {
+            let mut entries = heap.with_map(reference, |items| {
+                items.iter()
+                    .map(|(key, value)| format!("\"{key}\": {}", render_value(heap, value)))
+                    .collect::<Vec<_>>()
+            });
+            entries.sort();
+            format!("{{{}}}", entries.join(", "))
+        }
+        Value::Closure(reference) => {
+            let closure = heap.get_closure(reference);
+            match &closure.function.name {
+                Some(name) => format!("<closure {name}>"),
+                None => "<closure>".into(),
+            }
+        }
+        Value::StructInstance(reference) => {
+            let instance = heap.get_struct_instance(reference);
+            let mut entries = instance
+                .fields
+                .iter()
+                .map(|(key, value)| format!("{key}: {}", render_value(heap, value)))
+                .collect::<Vec<_>>();
+            entries.sort();
+            format!("{} {{ {} }}", instance.type_name, entries.join(", "))
+        }
+        Value::EnumVariant(reference) => {
+            let variant = heap.get_enum_variant(reference);
+            if variant.fields.is_empty() {
+                format!("{}::{}", variant.enum_name, variant.variant_name)
+            } else {
+                let mut entries = variant
+                    .fields
+                    .iter()
+                    .map(|(key, value)| format!("{key}: {}", render_value(heap, value)))
+                    .collect::<Vec<_>>();
+                entries.sort();
+                format!(
+                    "{}::{} {{ {} }}",
+                    variant.enum_name,
+                    variant.variant_name,
+                    entries.join(", ")
+                )
+            }
+        }
+        Value::Function(function) => match &function.name {
+            Some(name) => format!("<fn {name}>"),
+            None => "<lambda>".into(),
+        },
+        Value::BoundMethod(method) => match &method.method.name {
+            Some(name) => format!("<bound {name}>"),
+            None => "<bound method>".into(),
+        },
+        Value::CompiledFunction(function) => match &function.name {
+            Some(name) => format!("<compiled {name}>"),
+            None => "<compiled lambda>".into(),
+        },
+        Value::NativeFunction(native) => format!("<native {}>", native.name()),
+        Value::VmBoundMethod(method) => match &method.method.name {
+            Some(name) => format!("<bound {name}>"),
+            None => "<bound vm method>".into(),
+        },
+        Value::Builtin(_) => "<builtin>".into(),
+        Value::Null => "null".into(),
+    }
+}
+
+pub fn string_value(heap: &mut GcHeap, value: impl Into<String>) -> Value {
+    Value::String(heap.alloc_string(value.into()))
+}
+
+pub fn array_value(heap: &mut GcHeap, items: Vec<Value>) -> Value {
+    Value::Array(heap.alloc_array(items))
+}
+
+pub fn map_value(heap: &mut GcHeap, items: HashMap<String, Value>) -> Value {
+    Value::Map(heap.alloc_map(items))
+}
+
+pub fn closure_value(
+    heap: &mut GcHeap,
+    function: Rc<CompiledFunction>,
+    upvalues: Vec<Rc<RefCell<Value>>>,
+) -> Value {
+    Value::Closure(heap.alloc_closure(ClosureObject { function, upvalues }))
+}
+
+pub fn struct_instance_value(
+    heap: &mut GcHeap,
+    type_name: String,
+    fields: HashMap<String, Value>,
+) -> Value {
+    Value::StructInstance(heap.alloc_struct_instance(StructInstanceObject { type_name, fields }))
+}
+
+pub fn enum_variant_value(
+    heap: &mut GcHeap,
+    enum_name: String,
+    variant_name: String,
+    fields: HashMap<String, Value>,
+) -> Value {
+    Value::EnumVariant(heap.alloc_enum_variant(EnumVariantObject {
+        enum_name,
+        variant_name,
+        fields,
+    }))
 }
 
 impl NativeFunction {

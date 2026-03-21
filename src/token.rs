@@ -1,6 +1,4 @@
 //! Token 定義。
-//!
-//! lexer 會把原始碼切成 token，parser 再把 token 串接成 AST。
 
 /// 原始碼位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,19 +13,20 @@ impl Span {
     }
 }
 
-/// 帶有位置資訊的 token。
+/// 帶位置資訊的 token。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpannedToken {
     pub token: Token,
     pub span: Span,
 }
 
-/// tiny-lang 的 token 集合。
+/// tiny-lang token 列舉。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Let,
     Fn,
     Struct,
+    Enum,
     New,
     Match,
     Return,
@@ -67,6 +66,7 @@ pub enum Token {
     Not,
     Pipe,
     Colon,
+    ColonColon,
     Dot,
     LParen,
     RParen,
