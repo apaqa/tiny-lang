@@ -1023,10 +1023,12 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
 
                     let mut resolved = Vec::new();
                     for (index, binding_name) in binding_names.iter().enumerate() {
-                        if let Some(value) = ev.fields.get(binding_name).cloned() {
-                            resolved.push((binding_name.clone(), value));
-                        } else if let Some((_, value)) = ordered_fields.get(index) {
+                        if ev.fields.contains_key(binding_name.as_str()) {
+                            // Binding name matches a named field: bind the whole variant so the
+                            // body can do `binding.field_name` (matches VM compiler semantics).
                             resolved.push((binding_name.clone(), value.clone()));
+                        } else if let Some((_, field_val)) = ordered_fields.get(index) {
+                            resolved.push((binding_name.clone(), field_val.clone()));
                         } else {
                             return None;
                         }
