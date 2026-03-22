@@ -106,6 +106,14 @@ pub enum Statement {
         return_type: Option<TypeAnnotation>,
         body: Vec<Statement>,
     },
+    /// 中文註解：async 函式宣告，呼叫時回傳 Future 而非立即執行。
+    AsyncFnDecl {
+        name: String,
+        type_params: Vec<String>,
+        params: Vec<(String, Option<TypeAnnotation>)>,
+        return_type: Option<TypeAnnotation>,
+        body: Vec<Statement>,
+    },
     MethodDecl {
         struct_name: String,
         method_name: String,
@@ -186,6 +194,10 @@ pub enum Expr {
     Lambda {
         params: Vec<String>,
         body: Vec<Statement>,
+    },
+    /// 中文註解：await 表達式，對 Future 求值並等待結果。
+    Await {
+        expr: Box<Expr>,
     },
 }
 

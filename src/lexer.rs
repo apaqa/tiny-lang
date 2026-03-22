@@ -271,6 +271,8 @@ impl Lexer {
             "catch" => Token::Catch,
             "import" => Token::Import,
             "print" => Token::Print,
+            "async" => Token::Async,
+            "await" => Token::Await,
             "true" => Token::True,
             "false" => Token::False,
             "null" => Token::Null,

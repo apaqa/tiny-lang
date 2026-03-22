@@ -12,7 +12,7 @@ use crate::ast::{
 };
 use crate::environment::{
     array_value, enum_variant_value, map_value, render_value, string_value, struct_instance_value,
-    BuiltinFunction, EnumDef, EnvRef, Environment, FunctionValue, InterfaceDef, StructDef, Value,
+    BuiltinFunction, EnumDef, EnvRef, Environment, FunctionValue, FutureValue, InterfaceDef, StructDef, Value,
 };
 use crate::error::{Result, TinyLangError};
 use crate::gc::{GcHeap, GcStructRef};
@@ -212,6 +212,24 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 body,
             } => {
                 let function = Value::Function(FunctionValue {
+                    name: Some(name.clone()),
+                    params: params.clone(),
+                    return_type: return_type.clone(),
+                    body: body.clone(),
+                    closure: self.env.clone(),
+                });
+                self.env.borrow_mut().define(name.clone(), function);
+                Ok(Value::Null)
+            }
+            Statement::AsyncFnDecl {
+                name,
+                type_params: _,
+                params,
+                return_type,
+                body,
+            } => {
+                // 中文註解：async 函式宣告，以 AsyncFunction 值儲存，呼叫時回傳 Future。
+                let function = Value::AsyncFunction(FunctionValue {
                     name: Some(name.clone()),
                     params: params.clone(),
                     return_type: return_type.clone(),
@@ -428,12 +446,34 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                 body: body.clone(),
                 closure: self.env.clone(),
             })),
+            Expr::Await { expr } => {
+                // 中文註解：await 求值 Future，立即執行其本體並回傳結果（模擬非同步語意）。
+                let value = self.evaluate_expr(expr)?;
+                match value {
+                    Value::Future(future) => {
+                        let result = match self.execute_block(&future.body, future.closure) {
+                            Ok(v) => v,
+                            Err(Signal::Control(ControlFlow::Return(v))) => v,
+                            Err(err) => return Err(err),
+                        };
+                        if let Some(annotation) = &future.return_type {
+                            self.ensure_type_matches(annotation, &result)?;
+                        }
+                        Ok(result)
+                    }
+                    other => Err(Signal::Error(TinyLangError::runtime(format!(
+                        "await expects a Future, got {}",
+                        other.type_name_for_error()
+                    )))),
+                }
+            }
         }
     }
 
     fn call_value(&mut self, callable: Value, args: &[Expr]) -> RuntimeResult<Value> {
         match callable {
             Value::Function(function) => self.call_user_function(&function, args),
+            Value::AsyncFunction(function) => self.call_async_function(&function, args),
             Value::BoundMethod(method) => {
                 let mut values = Vec::with_capacity(args.len());
                 for arg in args {
@@ -492,6 +532,33 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         }
 
         Ok(result)
+    }
+
+    fn call_async_function(&mut self, function: &FunctionValue, args: &[Expr]) -> RuntimeResult<Value> {
+        // 中文註解：async 函式呼叫時不立即執行本體，而是捕獲引數並封裝成 Future 回傳。
+        if function.params.len() != args.len() {
+            let name = function.name.as_deref().unwrap_or("<async fn>");
+            return Err(Signal::Error(TinyLangError::runtime(format!(
+                "Async function '{name}' expects {} arguments, got {}",
+                function.params.len(),
+                args.len()
+            ))));
+        }
+
+        let call_env = Environment::enclosed(function.closure.clone());
+        for ((param, annotation), arg) in function.params.iter().zip(args.iter()) {
+            let value = self.evaluate_expr(arg)?;
+            if let Some(annotation) = annotation {
+                self.ensure_type_matches(annotation, &value)?;
+            }
+            call_env.borrow_mut().define_typed(param.clone(), value, annotation.clone());
+        }
+
+        Ok(Value::Future(FutureValue {
+            body: function.body.clone(),
+            closure: call_env,
+            return_type: function.return_type.clone(),
+        }))
     }
 
     fn call_method_with_values(

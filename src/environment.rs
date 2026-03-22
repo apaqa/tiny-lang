@@ -24,6 +24,10 @@ pub enum Value {
     StructInstance(GcStructRef),
     EnumVariant(GcEnumVariantRef),
     Function(FunctionValue),
+    /// 中文註解：async 函式，呼叫後產生 Future。
+    AsyncFunction(FunctionValue),
+    /// 中文註解：Future 值，代表尚未完成的非同步運算。
+    Future(FutureValue),
     BoundMethod(BoundMethodValue),
     CompiledFunction(Rc<CompiledFunction>),
     NativeFunction(NativeFunction),
@@ -47,6 +51,14 @@ pub struct FunctionValue {
     pub return_type: Option<TypeAnnotation>,
     pub body: Vec<Statement>,
     pub closure: EnvRef,
+}
+
+/// 中文註解：Future 值，封裝 async 函式被呼叫後尚未執行的運算本體。
+#[derive(Debug, Clone)]
+pub struct FutureValue {
+    pub body: Vec<Statement>,
+    pub closure: EnvRef,
+    pub return_type: Option<TypeAnnotation>,
 }
 
 /// struct 定義。
@@ -378,11 +390,13 @@ impl Value {
             Value::StructInstance(_) => "Struct",
             Value::EnumVariant(_) => "Enum",
             Value::Function(_)
+            | Value::AsyncFunction(_)
             | Value::BoundMethod(_)
             | Value::CompiledFunction(_)
             | Value::NativeFunction(_)
             | Value::VmBoundMethod(_)
             | Value::Builtin(_) => "Function",
+            Value::Future(_) => "Future",
             Value::Null => "Null",
         }
     }
@@ -398,11 +412,13 @@ impl Value {
             Value::StructInstance(_) => "struct".into(),
             Value::EnumVariant(_) => "enum".into(),
             Value::Function(_)
+            | Value::AsyncFunction(_)
             | Value::BoundMethod(_)
             | Value::CompiledFunction(_)
             | Value::NativeFunction(_)
             | Value::VmBoundMethod(_)
             | Value::Builtin(_) => "function".into(),
+            Value::Future(_) => "future".into(),
             Value::Null => "null".into(),
         }
     }
@@ -418,11 +434,13 @@ impl Value {
             Value::StructInstance(_) => "struct".into(),
             Value::EnumVariant(_) => "enum".into(),
             Value::Function(_)
+            | Value::AsyncFunction(_)
             | Value::BoundMethod(_)
             | Value::CompiledFunction(_)
             | Value::NativeFunction(_)
             | Value::VmBoundMethod(_)
             | Value::Builtin(_) => "function".into(),
+            Value::Future(_) => "future".into(),
             Value::Null => "null".into(),
         }
     }
@@ -483,6 +501,8 @@ impl PartialEq for Value {
             (Value::EnumVariant(a), Value::EnumVariant(b)) => a == b,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Function(a), Value::Function(b)) => a == b,
+            (Value::AsyncFunction(a), Value::AsyncFunction(b)) => a == b,
+            (Value::Future(_), Value::Future(_)) => false,
             (Value::BoundMethod(a), Value::BoundMethod(b)) => a == b,
             (Value::CompiledFunction(a), Value::CompiledFunction(b)) => a == b,
             (Value::NativeFunction(a), Value::NativeFunction(b)) => a == b,
@@ -510,6 +530,11 @@ impl std::fmt::Display for Value {
                 Some(name) => write!(f, "<fn {name}>"),
                 None => write!(f, "<lambda>"),
             },
+            Value::AsyncFunction(function) => match &function.name {
+                Some(name) => write!(f, "<async fn {name}>"),
+                None => write!(f, "<async lambda>"),
+            },
+            Value::Future(_) => write!(f, "<future>"),
             Value::BoundMethod(method) => match &method.method.name {
                 Some(name) => write!(f, "<bound {name}>"),
                 None => write!(f, "<bound method>"),
@@ -594,6 +619,11 @@ pub fn render_value(heap: &GcHeap, value: &Value) -> String {
             Some(name) => format!("<fn {name}>"),
             None => "<lambda>".into(),
         },
+        Value::AsyncFunction(function) => match &function.name {
+            Some(name) => format!("<async fn {name}>"),
+            None => "<async lambda>".into(),
+        },
+        Value::Future(_) => "<future>".into(),
         Value::BoundMethod(method) => match &method.method.name {
             Some(name) => format!("<bound {name}>"),
             None => "<bound method>".into(),

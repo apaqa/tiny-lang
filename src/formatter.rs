@@ -29,7 +29,10 @@ impl Formatter {
         for (index, statement) in program.iter().enumerate() {
             let is_fn_like = matches!(
                 statement,
-                Statement::FnDecl { .. } | Statement::MethodDecl { .. } | Statement::ImplInterface { .. }
+                Statement::FnDecl { .. }
+                    | Statement::AsyncFnDecl { .. }
+                    | Statement::MethodDecl { .. }
+                    | Statement::ImplInterface { .. }
             );
             if index > 0 {
                 self.output.push('\n');
@@ -174,6 +177,24 @@ impl Formatter {
                 body,
             } => {
                 self.output.push_str("fn ");
+                self.output.push_str(name);
+                if !type_params.is_empty() {
+                    self.output.push('<');
+                    self.output.push_str(&type_params.join(", "));
+                    self.output.push('>');
+                }
+                self.write_function_signature(params, return_type);
+                self.output.push(' ');
+                self.write_block(body);
+            }
+            Statement::AsyncFnDecl {
+                name,
+                type_params,
+                params,
+                return_type,
+                body,
+            } => {
+                self.output.push_str("async fn ");
                 self.output.push_str(name);
                 if !type_params.is_empty() {
                     self.output.push('<');
@@ -427,6 +448,7 @@ impl Formatter {
                 nested.write_block(body);
                 nested.output
             }
+            Expr::Await { expr } => format!("await {}", self.format_expr(expr)),
         }
     }
 

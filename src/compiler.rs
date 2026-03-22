@@ -366,6 +366,24 @@ impl Compiler {
                 }
                 Ok(())
             }
+            Statement::AsyncFnDecl {
+                name,
+                params,
+                return_type,
+                body,
+                ..
+            } => {
+                // 中文註解：VM 模式下將 async fn 編譯為普通函式（await 在 VM 中直接求值）。
+                let function = self.compile_function(Some(name.clone()), params.clone(), return_type.clone(), body, false)?;
+                let constant = self.push_constant(Value::CompiledFunction(function));
+                self.emit(OpCode::Constant(constant));
+                if self.scope_depth == 0 {
+                    self.emit(OpCode::SetGlobal(name.clone()));
+                } else {
+                    self.add_local(name.clone());
+                }
+                Ok(())
+            }
             Statement::Return(expr) => {
                 self.compile_expr(expr)?;
                 self.emit(OpCode::Return);
@@ -496,6 +514,10 @@ impl Compiler {
             Expr::Lambda { params, body } => {
                 // 編譯 lambda：分析捕獲的外部變數，生成 MakeClosure 指令
                 self.compile_lambda(params, body)?;
+            }
+            Expr::Await { expr } => {
+                // 中文註解：VM 模式下 await 直接編譯內部表達式（不產生 Future 包裝）。
+                self.compile_expr(expr)?;
             }
             Expr::EnumVariant { enum_name, variant, fields } => {
                 // 編譯 enum variant 建立：推送所有欄位值，發出 MakeEnumVariant
@@ -1180,7 +1202,7 @@ fn collect_stmt_idents(stmt: &Statement, set: &mut HashSet<String>) {
                 }
             }
         }
-        Statement::FnDecl { body, .. } => {
+        Statement::FnDecl { body, .. } | Statement::AsyncFnDecl { body, .. } => {
             for s in body {
                 collect_stmt_idents(s, set);
             }
@@ -1248,6 +1270,7 @@ fn collect_expr_idents(expr: &Expr, set: &mut HashSet<String>) {
                 collect_stmt_idents(s, set);
             }
         }
+        Expr::Await { expr } => collect_expr_idents(expr, set),
         _ => {}
     }
 }

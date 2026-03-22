@@ -158,6 +158,23 @@ impl TypeChecker {
                         },
                     );
                 }
+                Statement::AsyncFnDecl {
+                    name,
+                    type_params,
+                    params,
+                    return_type,
+                    ..
+                } => {
+                    // 中文註解：async 函式宣告與普通函式同樣收集進 func_env。
+                    self.func_env.insert(
+                        name.clone(),
+                        FuncSig {
+                            type_params: type_params.clone(),
+                            params: params.clone(),
+                            return_type: return_type.clone(),
+                        },
+                    );
+                }
                 Statement::MethodDecl {
                     struct_name,
                     method_name,
@@ -402,6 +419,7 @@ impl TypeChecker {
                 _ => None,
             },
             Expr::FieldAccess { .. } | Expr::MapLit(_) | Expr::Lambda { .. } => None,
+            Expr::Await { .. } => None,
         }
     }
 
@@ -530,6 +548,30 @@ impl TypeChecker {
                         return_type: return_type.clone(),
                     },
                 );
+                self.push_scope();
+                self.push_generic_scope(type_params);
+                for (param_name, param_type) in params {
+                    if let Some(ty) = param_type {
+                        self.declare_var(param_name, self.normalize_type(ty));
+                    }
+                }
+                let outer = self.current_return_type.take();
+                self.current_return_type = return_type.clone();
+                for s in body {
+                    self.check_statement(s);
+                }
+                self.current_return_type = outer;
+                self.pop_generic_scope();
+                self.pop_scope();
+            }
+            Statement::AsyncFnDecl {
+                name: _,
+                type_params,
+                params,
+                return_type,
+                body,
+            } => {
+                // 中文註解：async 函式的型別檢查與普通函式相同。
                 self.push_scope();
                 self.push_generic_scope(type_params);
                 for (param_name, param_type) in params {
@@ -837,6 +879,7 @@ impl TypeChecker {
                 }
                 self.pop_scope();
             }
+            Expr::Await { expr } => self.check_expr(expr),
             Expr::IntLit(_) | Expr::StringLit(_) | Expr::BoolLit(_) | Expr::NullLit | Expr::Ident(_) => {}
         }
     }

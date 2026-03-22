@@ -48,6 +48,7 @@ impl Parser {
             Token::Try => self.parse_try_catch_stmt(),
             Token::Match => self.parse_match_stmt(),
             Token::Print => self.parse_print_stmt(),
+            Token::Async => self.parse_async_fn_decl(),
             _ => self.parse_expr_or_assignment_stmt(),
         }
     }
@@ -231,6 +232,28 @@ impl Parser {
         let body = self.parse_block()?;
         Ok(Statement::FnDecl {
             name: first_name,
+            type_params,
+            params,
+            return_type,
+            body,
+        })
+    }
+
+    fn parse_async_fn_decl(&mut self) -> Result<Statement> {
+        // 中文註解：解析 async fn 宣告，語法與 fn 相同但加上 async 前綴。
+        self.expect_token(Token::Async)?;
+        self.expect_token(Token::Fn)?;
+        let name = self.consume_ident()?;
+        let type_params = self.parse_optional_type_params()?;
+        let params = self.parse_typed_parameter_list()?;
+        let return_type = if self.match_token(&Token::Arrow) {
+            Some(self.parse_type_annotation()?)
+        } else {
+            None
+        };
+        let body = self.parse_block()?;
+        Ok(Statement::AsyncFnDecl {
+            name,
             type_params,
             params,
             return_type,
@@ -623,6 +646,14 @@ impl Parser {
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Not,
                     operand: Box::new(operand),
+                })
+            }
+            Token::Await => {
+                self.advance();
+                // 中文註解：await 表達式，優先序與一元運算子相同。
+                let expr = self.parse_unary()?;
+                Ok(Expr::Await {
+                    expr: Box::new(expr),
                 })
             }
             _ => self.parse_postfix(),
