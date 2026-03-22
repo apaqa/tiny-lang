@@ -42,6 +42,7 @@ pub enum Token {
     Try,
     Catch,
     Import,
+    As,
     Print,
     Async,
     Await,

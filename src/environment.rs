@@ -345,6 +345,26 @@ impl Environment {
                 .is_some_and(|parent| parent.borrow().has_method(struct_name, method_name))
     }
 
+    /// 返回此層（不含 parent）所有 value 綁定，用於命名空間打包。
+    pub fn get_local_values(&self) -> HashMap<String, Value> {
+        self.values.iter().map(|(k, b)| (k.clone(), b.value.clone())).collect()
+    }
+
+    /// 返回此層所有 struct 定義，用於命名空間匯入傳播。
+    pub fn get_local_structs(&self) -> HashMap<String, StructDef> {
+        self.structs.clone()
+    }
+
+    /// 返回此層所有 method 定義，用於命名空間匯入傳播。
+    pub fn get_local_methods(&self) -> HashMap<String, HashMap<String, FunctionValue>> {
+        self.methods.clone()
+    }
+
+    /// 返回此層所有 enum 定義，用於命名空間匯入傳播。
+    pub fn get_local_enums(&self) -> HashMap<String, EnumDef> {
+        self.enums.clone()
+    }
+
     pub fn define_interface_impl(&mut self, struct_name: String, interface_name: String) {
         self.impls.entry(struct_name).or_default().insert(interface_name);
     }

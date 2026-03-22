@@ -236,6 +236,9 @@ impl<W: Write> VM<W> {
             OpCode::Import(path) => {
                 self.execute_import(&path)?;
             }
+            OpCode::ImportAs(path, alias) => {
+                self.execute_import_as(&path, &alias)?;
+            }
             OpCode::Add => self.execute_add()?,
             OpCode::Sub => self.execute_int_binary("subtract", |a, b| a - b)?,
             OpCode::Mul => self.execute_int_binary("multiply", |a, b| a * b)?,
@@ -597,6 +600,71 @@ impl<W: Write> VM<W> {
         }
 
         Ok(false)
+    }
+
+    fn execute_import_as(&mut self, path: &str, alias: &str) -> Result<()> {
+        let candidate = self.current_dir.join(path);
+        let canonical = std::fs::canonicalize(&candidate)
+            .map_err(|_| TinyLangError::runtime(format!("Import file not found: {path}")))?;
+
+        if self.imported_files.contains(&canonical) {
+            return Ok(());
+        }
+
+        let source =
+            std::fs::read_to_string(&canonical).map_err(|err| TinyLangError::io(err.to_string()))?;
+        let program = crate::parse_source(&source)?;
+        let chunk = crate::compiler::Compiler::compile_program_with_heap(&program, self.heap.clone())?;
+        self.heap = chunk.heap.clone();
+
+        self.imported_files.insert(canonical.clone());
+        let previous_dir = self.current_dir.clone();
+        if let Some(parent) = canonical.parent() {
+            self.current_dir = parent.to_path_buf();
+        }
+
+        // 中文註解：快照現有 globals，之後新增的即為此命名空間匯出。
+        let before_globals: HashSet<String> = self.globals.keys().cloned().collect();
+
+        self.structs.extend(chunk.structs.clone());
+        for (name, methods) in &chunk.methods {
+            self.methods.entry(name.clone()).or_default().extend(methods.clone());
+        }
+
+        // 同步執行匯入腳本（在當前 VM 的巢狀迴圈中跑完再繼續）。
+        let start_frame_count = self.frames.len();
+        self.push_script_frame(chunk, "<import-as>", None);
+
+        loop {
+            let instruction = match self.next_instruction() {
+                Some(instr) => instr,
+                None => break,
+            };
+            match self.execute_instruction(instruction) {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(err) => {
+                    self.current_dir = previous_dir;
+                    return Err(err);
+                }
+            }
+            if self.frames.len() <= start_frame_count {
+                break;
+            }
+        }
+
+        self.current_dir = previous_dir;
+
+        // 收集新 globals，打包為 Map 存於 alias。
+        let mut ns_values: HashMap<String, Value> = HashMap::new();
+        for (k, v) in &self.globals {
+            if !before_globals.contains(k) {
+                ns_values.insert(k.clone(), v.clone());
+            }
+        }
+        let ns_map = map_value(&mut self.heap, ns_values);
+        self.globals.insert(alias.to_string(), ns_map);
+        Ok(())
     }
 
     fn execute_import(&mut self, path: &str) -> Result<()> {
@@ -1000,6 +1068,11 @@ impl<W: Write> VM<W> {
                         variant_name, field
                     ))
                 })
+            }
+            // 命名空間 Map：namespace.fn_name 存取。
+            Value::Map(reference) => {
+                let field_value = self.heap.with_map(&reference, |m| m.get(field).cloned());
+                field_value.ok_or_else(|| TinyLangError::runtime(format!("Namespace has no member '{field}'")))
             }
             other => Err(TinyLangError::runtime(format!(
                 "Field access expects struct instance, got {}",

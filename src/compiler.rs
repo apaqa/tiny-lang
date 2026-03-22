@@ -39,6 +39,8 @@ pub enum OpCode {
     Throw,
     /// 中文註解：在 VM 內載入並執行另一個 tiny 檔案。
     Import(String),
+    /// 中文註解：命名空間匯入，將匯入的 globals 打包為 Map 存於 alias。
+    ImportAs(String, String),
     Add,
     Sub,
     Mul,
@@ -236,8 +238,11 @@ impl Compiler {
 
     fn compile_statement(&mut self, statement: &Statement) -> Result<()> {
         match statement {
-            Statement::Import { path } => {
-                self.emit(OpCode::Import(path.clone()));
+            Statement::Import { path, alias } => {
+                match alias {
+                    None => self.emit(OpCode::Import(path.clone())),
+                    Some(alias) => self.emit(OpCode::ImportAs(path.clone(), alias.clone())),
+                }
                 Ok(())
             }
             Statement::InterfaceDecl { .. } => Ok(()),

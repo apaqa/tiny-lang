@@ -126,7 +126,8 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
 
     fn execute_statement(&mut self, statement: &Statement) -> RuntimeResult<Value> {
         match statement {
-            Statement::Import { path } => self.execute_import(path),
+            Statement::Import { path, alias: None } => self.execute_import(path),
+            Statement::Import { path, alias: Some(alias) } => self.execute_import_as(path, alias),
             Statement::StructDecl { name, fields } => {
                 self.env.borrow_mut().define_struct(
                     name.clone(),
@@ -368,6 +369,53 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
         }
 
         result
+    }
+
+    fn execute_import_as(&mut self, path: &str, alias: &str) -> RuntimeResult<Value> {
+        let candidate = self.current_dir.join(path);
+        let canonical = fs::canonicalize(&candidate).map_err(|_| {
+            Signal::Error(TinyLangError::runtime(format!("Import file not found: {path}")))
+        })?;
+
+        let source = fs::read_to_string(&canonical)
+            .map_err(|err| Signal::Error(TinyLangError::io(err.to_string())))?;
+        let program = crate::parse_source(&source).map_err(Signal::Error)?;
+
+        // 中文註解：在隔離的子環境中執行，收集區域綁定作為命名空間 Map。
+        let ns_env = Environment::enclosed(self.env.clone());
+        self.imported_files.insert(canonical.clone());
+        let previous_dir = self.current_dir.clone();
+        if let Some(parent) = canonical.parent() {
+            self.current_dir = parent.to_path_buf();
+        }
+        let result = self.execute_block(&program, ns_env.clone());
+        self.current_dir = previous_dir;
+        if result.is_err() {
+            self.imported_files.remove(&canonical);
+            return result;
+        }
+
+        // 傳播 struct / method / enum 定義到主環境。
+        let local_structs = ns_env.borrow().get_local_structs();
+        for (name, def) in local_structs {
+            self.env.borrow_mut().define_struct(name, def);
+        }
+        let local_methods = ns_env.borrow().get_local_methods();
+        for (struct_name, methods) in local_methods {
+            for (method_name, method) in methods {
+                self.env.borrow_mut().define_method(struct_name.clone(), method_name, method);
+            }
+        }
+        let local_enums = ns_env.borrow().get_local_enums();
+        for (name, def) in local_enums {
+            self.env.borrow_mut().define_enum(name, def);
+        }
+
+        // 將函式與值打包成 Map，存於 alias。
+        let local_values = ns_env.borrow().get_local_values();
+        let ns_map = map_value(&mut self.heap, local_values);
+        self.env.borrow_mut().define(alias.to_string(), ns_map);
+        Ok(Value::Null)
     }
 
     fn evaluate_expr(&mut self, expr: &Expr) -> RuntimeResult<Value> {
@@ -1318,6 +1366,15 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
                     )))
                 })
             }
+            // 命名空間 Map：namespace.fn_name 存取。
+            Value::Map(reference) => {
+                let field_value = self.heap.with_map(&reference, |m| m.get(field).cloned());
+                field_value.ok_or_else(|| {
+                    Signal::Error(TinyLangError::runtime(format!(
+                        "Namespace has no member '{field}'"
+                    )))
+                })
+            }
             other => Err(Signal::Error(TinyLangError::runtime(format!(
                 "Field access expects struct instance, got {}",
                 other.type_name_for_error()
@@ -1366,6 +1423,9 @@ impl<W: Write, R: BufRead> Interpreter<W, R> {
             },
             TypeAnnotation::Named(name) => match value {
                 _ if is_runtime_generic_type_name(name) => true,
+                // 允許 named "map" / "array" 作為型別別名，方便函式庫標注。
+                Value::Map(_) if name == "map" => true,
+                Value::Array(_) if name == "array" => true,
                 Value::StructInstance(instance) => {
                     let instance = instance.clone();
                     self.heap.with_struct_instance(&instance, |inst| {

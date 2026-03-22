@@ -59,8 +59,14 @@ impl Parser {
         let Token::StringLit(path) = path_token.token else {
             return Err(TinyLangError::parse("import expects a string path", path_token.span));
         };
+        let alias = if self.check(&Token::As) {
+            self.advance();
+            Some(self.consume_ident()?)
+        } else {
+            None
+        };
         self.expect_token(Token::Semicolon)?;
-        Ok(Statement::Import { path })
+        Ok(Statement::Import { path, alias })
     }
 
     fn parse_struct_decl(&mut self) -> Result<Statement> {
@@ -270,7 +276,10 @@ impl Parser {
 
     fn parse_if_else_stmt(&mut self) -> Result<Statement> {
         self.expect_token(Token::If)?;
+        let previous = self.allow_struct_init;
+        self.allow_struct_init = false;
         let condition = self.parse_expression()?;
+        self.allow_struct_init = previous;
         let then_body = self.parse_block()?;
         let else_body = if self.match_token(&Token::Else) {
             Some(self.parse_block()?)
@@ -287,7 +296,10 @@ impl Parser {
 
     fn parse_while_stmt(&mut self) -> Result<Statement> {
         self.expect_token(Token::While)?;
+        let previous = self.allow_struct_init;
+        self.allow_struct_init = false;
         let condition = self.parse_expression()?;
+        self.allow_struct_init = previous;
         let body = self.parse_block()?;
         Ok(Statement::While { condition, body })
     }

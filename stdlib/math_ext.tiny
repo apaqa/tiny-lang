@@ -1,0 +1,60 @@
+// tiny-lang 標準庫：math_ext 模組
+// 提供 gcd、lcm、factorial、fibonacci 等數學函式。
+
+fn gcd(a: int, b: int) -> int {
+    if b == 0 {
+        return a;
+    }
+    return gcd(b, a % b);
+}
+
+fn lcm(a: int, b: int) -> int {
+    return (a / gcd(a, b)) * b;
+}
+
+fn factorial(n: int) -> int {
+    if n <= 1 {
+        return 1;
+    }
+    return n * factorial(n - 1);
+}
+
+fn fibonacci(n: int) -> int {
+    if n <= 0 {
+        return 0;
+    }
+    if n == 1 {
+        return 1;
+    }
+    let a: int = 0;
+    let b: int = 1;
+    let i: int = 2;
+    while i <= n {
+        let tmp: int = a + b;
+        a = b;
+        b = tmp;
+        i = i + 1;
+    }
+    return b;
+}
+
+fn is_prime(n: int) -> bool {
+    if n < 2 {
+        return false;
+    }
+    let i: int = 2;
+    while i * i <= n {
+        if n % i == 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn abs_val(n: int) -> int {
+    if n < 0 {
+        return 0 - n;
+    }
+    return n;
+}

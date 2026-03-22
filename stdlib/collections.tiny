@@ -1,0 +1,66 @@
+// tiny-lang 標準庫：collections 模組
+// 提供 LinkedList 和 Stack 兩種資料結構。
+
+// ── LinkedList ──────────────────────────────────────────────────────────────
+// 使用 map 模擬節點；LinkedList 本身記錄 head（map）和 size。
+
+fn linked_list_new() -> map {
+    return {"head": null, "size": 0};
+}
+
+fn linked_list_prepend(list: map, value: any) -> map {
+    let node: map = {"value": value, "next": list["head"]};
+    list["head"] = node;
+    list["size"] = list["size"] + 1;
+    return list;
+}
+
+fn linked_list_to_array(list: map) -> [any] {
+    let result: [any] = [];
+    let current: any = list["head"];
+    while current != null {
+        push(result, current["value"]);
+        current = current["next"];
+    }
+    return result;
+}
+
+fn linked_list_size(list: map) -> int {
+    return list["size"];
+}
+
+fn linked_list_is_empty(list: map) -> bool {
+    return list["size"] == 0;
+}
+
+// ── Stack ────────────────────────────────────────────────────────────────────
+// 以 array 實作的後進先出堆疊。
+
+fn stack_new() -> [any] {
+    return [];
+}
+
+fn stack_push(s: [any], value: any) -> [any] {
+    push(s, value);
+    return s;
+}
+
+fn stack_pop(s: [any]) -> any {
+    return pop(s);
+}
+
+fn stack_peek(s: [any]) -> any {
+    let n: int = len(s);
+    if n == 0 {
+        return null;
+    }
+    return s[n - 1];
+}
+
+fn stack_size(s: [any]) -> int {
+    return len(s);
+}
+
+fn stack_is_empty(s: [any]) -> bool {
+    return len(s) == 0;
+}

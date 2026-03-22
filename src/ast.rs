@@ -61,7 +61,7 @@ pub struct InterfaceMethod {
 /// 陳述式。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    Import { path: String },
+    Import { path: String, alias: Option<String> },
     StructDecl {
         name: String,
         fields: Vec<(String, Option<TypeAnnotation>)>,

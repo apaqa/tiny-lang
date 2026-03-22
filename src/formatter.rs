@@ -49,9 +49,13 @@ impl Formatter {
     fn write_statement(&mut self, statement: &Statement) {
         self.write_indent();
         match statement {
-            Statement::Import { path } => {
+            Statement::Import { path, alias } => {
                 self.output.push_str("import ");
                 self.output.push_str(&self.format_string_literal(path));
+                if let Some(alias) = alias {
+                    self.output.push_str(" as ");
+                    self.output.push_str(alias);
+                }
                 self.output.push(';');
             }
             Statement::StructDecl { name, fields } => {
