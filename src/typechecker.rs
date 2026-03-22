@@ -1,6 +1,5 @@
 //! tiny-lang 型別檢查器
 use std::collections::{HashMap, HashSet};
-use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     BinaryOperator, Expr, InterfaceMethod, MatchArm, Pattern, Program, Statement, TypeAnnotation, UnaryOperator,
@@ -179,6 +178,7 @@ impl TypeChecker {
                 Statement::ImplInterface {
                     struct_name, methods, ..
                 } => {
+                    let mut local_errors: Vec<String> = Vec::new();
                     let method_map = self.method_env.entry(struct_name.clone()).or_default();
                     for method in methods {
                         if let Statement::FnDecl {
@@ -189,14 +189,14 @@ impl TypeChecker {
                         } = method
                         {
                             let Some((receiver, method_params)) = params.split_first() else {
-                                self.add_error(format!(
+                                local_errors.push(format!(
                                     "impl method '{}.{}' must declare self as the first parameter",
                                     struct_name, name
                                 ));
                                 continue;
                             };
                             if receiver.0 != "self" {
-                                self.add_error(format!(
+                                local_errors.push(format!(
                                     "impl method '{}.{}' must declare self as the first parameter",
                                     struct_name, name
                                 ));
@@ -211,6 +211,9 @@ impl TypeChecker {
                                 },
                             );
                         }
+                    }
+                    for err in local_errors {
+                        self.add_error(err);
                     }
                 }
                 _ => {}
